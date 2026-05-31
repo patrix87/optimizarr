@@ -15,6 +15,7 @@ from optimizarr.features.optimizer.worker import (
     _is_importable_downgrade,
     _is_score_regression,
     age_ok,
+    order_pool,
 )
 from optimizarr.http import ArrTimeout
 
@@ -416,6 +417,76 @@ def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     w._build_pool(ctx, now)
     assert set(ctx.pool) == {1, 2, 3}
     assert ctx.evaluated == set()
+
+
+# ----- pick_order -----
+
+
+def _ordering_items():
+    # id -> movie with embedded file (size, dateAdded) and a release date, deliberately
+    # out of id order on every key so a sort that ignored the key would still pass by luck.
+    return {
+        1: {
+            "id": 1,
+            "title": "Matrix",
+            "year": 1999,
+            "movieFile": {"size": 30 * GB, "dateAdded": "2026-02-01T00:00:00Z"},
+            "digitalRelease": "2025-06-01T00:00:00Z",
+        },
+        2: {
+            "id": 2,
+            "title": "zodiac",  # lowercase: alphabetical must be case-insensitive
+            "year": 2007,
+            "movieFile": {"size": 10 * GB, "dateAdded": "2026-03-01T00:00:00Z"},
+            "digitalRelease": "2025-01-01T00:00:00Z",
+        },
+        3: {
+            "id": 3,
+            "title": "Alien",
+            "year": 1979,
+            "movieFile": {"size": 20 * GB, "dateAdded": "2026-01-01T00:00:00Z"},
+            "digitalRelease": "2025-12-01T00:00:00Z",
+        },
+    }
+
+
+def test_order_pool_size():
+    items = _ordering_items()
+    pool = [1, 2, 3]
+    api = _radarr_api()
+    assert order_pool(list(pool), items, api, "size_asc") == [2, 3, 1]
+    assert order_pool(list(pool), items, api, "size_desc") == [1, 3, 2]
+
+
+def test_order_pool_date_added():
+    items = _ordering_items()
+    pool = [1, 2, 3]
+    api = _radarr_api()
+    assert order_pool(list(pool), items, api, "date_added_asc") == [3, 1, 2]
+    assert order_pool(list(pool), items, api, "date_added_desc") == [2, 1, 3]
+
+
+def test_order_pool_release_date():
+    items = _ordering_items()
+    pool = [1, 2, 3]
+    api = _radarr_api()
+    assert order_pool(list(pool), items, api, "release_date_asc") == [2, 1, 3]
+    assert order_pool(list(pool), items, api, "release_date_desc") == [3, 1, 2]
+
+
+def test_order_pool_alphabetical():
+    # Alien, Matrix, zodiac -> case-insensitive A->Z is [3, 1, 2] regardless of input order.
+    items = _ordering_items()
+    api = _radarr_api()
+    assert order_pool([1, 2, 3], items, api, "alphabetical_asc") == [3, 1, 2]
+    assert order_pool([1, 2, 3], items, api, "alphabetical_desc") == [2, 1, 3]
+
+
+def test_order_pool_random_keeps_membership():
+    items = _ordering_items()
+    api = _radarr_api()
+    out = order_pool([1, 2, 3], items, api, "random")
+    assert sorted(out) == [1, 2, 3]
 
 
 class _QueueAdapter(ArrApi):

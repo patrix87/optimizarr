@@ -18,6 +18,7 @@ app-agnostic.
 """
 
 import logging
+import random
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -52,6 +53,32 @@ _MANUAL_IMPORT_TIMEOUT_SEC = 300
 # burning the 5-min timeout on a permanently broken record every tick. Counter is in-memory
 # only — a worker restart gives every record a clean slate.
 _MANUAL_IMPORT_MAX_FAILS = 3
+
+# pick_order -> (item sort key, reverse). "random" is handled separately (shuffle). The keys
+# read already-fetched item fields via the adapter (no extra HTTP); see ArrApi.label /
+# file_size / date_added / release_date. label() is casefolded for case-insensitive A->Z.
+_PICK_ORDER_KEYS: dict[str, tuple[Callable[[ArrApi, dict], object], bool]] = {
+    "alphabetical_asc": (lambda a, it: a.label(it).casefold(), False),
+    "alphabetical_desc": (lambda a, it: a.label(it).casefold(), True),
+    "size_asc": (lambda a, it: a.file_size(it), False),
+    "size_desc": (lambda a, it: a.file_size(it), True),
+    "date_added_asc": (lambda a, it: a.date_added(it), False),
+    "date_added_desc": (lambda a, it: a.date_added(it), True),
+    "release_date_asc": (lambda a, it: a.release_date(it), False),
+    "release_date_desc": (lambda a, it: a.release_date(it), True),
+}
+
+
+def order_pool(
+    pool: list[int], items_by_id: dict[int, dict], adapter: ArrApi, pick_order: str
+) -> list[int]:
+    """Order the active-item pool for this pass per the configured pick_order. Shuffles in
+    place for "random"; otherwise returns a new list sorted by the pick_order's key."""
+    if pick_order == "random":
+        random.shuffle(pool)
+        return pool
+    key, reverse = _PICK_ORDER_KEYS[pick_order]
+    return sorted(pool, key=lambda iid: key(adapter, items_by_id[iid]), reverse=reverse)
 
 
 class _ImportSlot:
@@ -233,10 +260,7 @@ class OptimizerWorker:
             ctx.evaluated.clear()
             ctx.pool = active(exclude_evaluated=False)
 
-        if self.opt.pick_order == "random":
-            import random
-
-            random.shuffle(ctx.pool)
+        ctx.pool = order_pool(ctx.pool, ctx.items_by_id, ctx.adapter, self.opt.pick_order)
 
     def _process_one(self, ctx: _AppContext, item_id: int) -> None:
         adapter = ctx.adapter

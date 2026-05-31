@@ -53,6 +53,9 @@ class SonarrApi(ArrApi):
     def runtime_h(self, item: dict) -> float:
         return (self._series(item).get("runtime") or 0) / 60
 
+    def release_date(self, item: dict) -> str:
+        return item.get("airDateUtc") or ""
+
     def profile_for(self, item: dict) -> tuple[str | None, int | None]:
         return self._profile(self._series(item).get("qualityProfileId"))
 

@@ -88,10 +88,10 @@ default_preset = "Balanced"
 # Each profile's one-sided size curve: n_size = 1.0 at/below (size_aim * target), then ramps
 # down to 0 at ceiling. Smaller than the aim is NEVER penalized -> nothing inflates a file.
 [optimizer.topsis.reference]
-"2160" = { floor = 3.0, target = 6.5, ceiling = 18 }
-"1080" = { floor = 1.0, target = 2.5, ceiling = 8 }
-"720"  = { floor = 0.4, target = 1.0, ceiling = 4 }
-"480"  = { floor = 0.2, target = 0.5, ceiling = 3 }
+"2160" = { floor = 3.5, target = 7.5, ceiling = 18 }
+"1080" = { floor = 1.5, target = 3.5, ceiling = 8 }
+"720"  = { floor = 0.5, target = 1.0, ceiling = 4 }
+"480"  = { floor = 0.25, target = 0.5, ceiling = 3 }
 
 # ----- Presets -----
 # Each preset = TOPSIS weights (score/resolution/size, sum 1.0) + a relative `size_aim`

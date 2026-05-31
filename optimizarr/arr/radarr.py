@@ -30,6 +30,13 @@ class RadarrApi(ArrApi):
     def runtime_h(self, item: dict) -> float:
         return (item.get("runtime") or 0) / 60
 
+    def release_date(self, item: dict) -> str:
+        # Prefer the digital release (the canonical date the age gate keys on), then physical,
+        # then theatrical, so a movie still sorts even before a digital date is known.
+        return (
+            item.get("digitalRelease") or item.get("physicalRelease") or item.get("inCinemas") or ""
+        )
+
     def profile_for(self, item: dict) -> tuple[str | None, int | None]:
         return self._profile(item.get("qualityProfileId"))
 

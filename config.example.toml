@@ -37,7 +37,13 @@ queue_max = 5
 # (importPending) or importing, so the import backlog drains first. importBlocked (manual-only)
 # is not counted, so a stuck manual item can't freeze grabs.
 import_max = 2
-# "random" or "ordered"
+# Order the worker walks the library each pass. The choice only changes which items are
+# improved first, never the per-item decision:
+#   random            shuffle each pass (default)
+#   alphabetical_asc  A->Z by title              alphabetical_desc  Z->A by title
+#   size_asc          smallest file first        size_desc          biggest file first
+#   date_added_asc    oldest import first        date_added_desc    newest import first
+#   release_date_asc  oldest release first       release_date_desc  newest release first
 pick_order = "random"
 # Short loop: seconds between processing items — also the wait when the queue is full or
 # the list is exhausted, and the settle delay so a grab surfaces before the next read. Min 10.
