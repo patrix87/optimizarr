@@ -1,8 +1,9 @@
 """Size-per-hour (GiB/h) stats for specific release cohorts, from a gather_training_data.py set.
 
-Rejected/temporarily-rejected releases are INCLUDED (no quality filtering). Two things are
-dropped: remux releases (lossless rips that skew size up; --include-remux keeps them) and
-releases with an unknown runtime (gbh = 0). Both drop counts are reported.
+Rejected/temporarily-rejected releases are INCLUDED (no quality filtering). Dropped by default:
+raw sources (remux + BR-DISK, which inflate size; --include-raw keeps them), non-H.264/H.265
+codecs (AV1/XviD/DivX/VC-1/etc; --any-codec keeps them), and releases with an unknown runtime
+(gbh = 0). Each drop count is reported.
 
 Cohorts:
   A. Profile-matched, high score: target profile resolution == result resolution, score > --score
@@ -30,11 +31,24 @@ def _load(path: Path) -> list[dict]:
     return [json.loads(ln) for ln in lines if ln.strip()]
 
 
-def _is_remux(r: dict) -> bool:
-    """Remux releases (lossless rips, not encodes) skew size stats up, so they're excluded by
-    default. Caught by the quality name (Remux-2160p/1080p) or 'remux' in the release title."""
+def _is_raw(r: dict) -> bool:
+    """Raw, non-encode sources (remux lossless rips and full BR-DISK) inflate size stats, so
+    they're dropped by default. Remux: quality name 'Remux-*' or 'remux' in the title. BR-DISK:
+    Radarr's full-disc quality name."""
     name = (r.get("quality_name") or "").lower()
-    return "remux" in name or "remux" in (r.get("title") or "").lower()
+    title = (r.get("title") or "").lower()
+    return "remux" in name or "remux" in title or "br-disk" in name
+
+
+def _codec(r: dict) -> str:
+    """Classify the title's video codec: 'hevc' (x265/H.265), 'avc' (x264/H.264), or 'other'
+    (AV1, XviD/DivX, VC-1, MPEG-2, or unidentifiable)."""
+    t = (r.get("title") or "").lower().replace(".", "")
+    if "x265" in t or "h265" in t or "hevc" in t:
+        return "hevc"
+    if "x264" in t or "h264" in t or "avc" in t:
+        return "avc"
+    return "other"
 
 
 def _pct(sorted_vals: list[float], p: float) -> float:
@@ -85,7 +99,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("dataset", type=Path, help="JSONL from gather_training_data.py")
     ap.add_argument("--score", type=float, default=800_000.0, help="group-A score-above threshold")
-    ap.add_argument("--include-remux", action="store_true", help="keep remux (default: excluded)")
+    ap.add_argument("--include-raw", action="store_true", help="keep remux + BR-DISK")
+    ap.add_argument(
+        "--any-codec", action="store_true", help="keep all codecs (default: H.264/H.265)"
+    )
     args = ap.parse_args()
 
     def label_a(res: int) -> str:
@@ -96,14 +113,16 @@ def main() -> None:
     # cohort name -> list of gbh
     a: dict[str, list[float]] = {}  # profile-matched + high score
     b: dict[int, list[float]] = {}  # by result resolution, any profile/score
-    skipped_no_runtime = 0
-    skipped_remux = 0
+    skipped_no_runtime = skipped_raw = skipped_codec = 0
 
     for rec in records:
         target = (rec.get("profile") or {}).get("target_resolution")
         for r in rec.get("releases", []):
-            if not args.include_remux and _is_remux(r):
-                skipped_remux += 1
+            if not args.include_raw and _is_raw(r):
+                skipped_raw += 1
+                continue
+            if not args.any_codec and _codec(r) == "other":
+                skipped_codec += 1
                 continue
             gbh = r.get("gbh") or 0
             if gbh <= 0:  # unknown runtime: cannot form a size-per-hour value
@@ -119,7 +138,9 @@ def main() -> None:
         "# Size-per-hour (GiB/h) cohorts",
         "",
         f"- dataset: `{args.dataset}`  items: {len(records)}",
-        f"- remux: {'INCLUDED' if args.include_remux else f'excluded ({skipped_remux} dropped)'}",
+        f"- raw sources (remux + BR-DISK): "
+        f"{'INCLUDED' if args.include_raw else f'excluded ({skipped_raw} dropped)'}",
+        f"- codec: {'ALL' if args.any_codec else f'H.264/H.265 only ({skipped_codec} dropped)'}",
         f"- rejected releases included; {skipped_no_runtime} dropped for unknown runtime",
         "",
         "## A. Profile-matched, score above threshold",
