@@ -1,7 +1,8 @@
 """Size-per-hour (GiB/h) stats for specific release cohorts, from a gather_training_data.py set.
 
-NO filtering is applied (rejected/temporarily-rejected releases are included); only releases with
-an unknown runtime (gbh = 0, no size-per-hour possible) are dropped, and that count is reported.
+Rejected/temporarily-rejected releases are INCLUDED (no quality filtering). Two things are
+dropped: remux releases (lossless rips that skew size up; --include-remux keeps them) and
+releases with an unknown runtime (gbh = 0). Both drop counts are reported.
 
 Cohorts:
   A. Profile-matched, high score: target profile resolution == result resolution, score > --score
@@ -27,6 +28,13 @@ from pathlib import Path
 def _load(path: Path) -> list[dict]:
     lines = path.read_text(encoding="utf-8").splitlines()
     return [json.loads(ln) for ln in lines if ln.strip()]
+
+
+def _is_remux(r: dict) -> bool:
+    """Remux releases (lossless rips, not encodes) skew size stats up, so they're excluded by
+    default. Caught by the quality name (Remux-2160p/1080p) or 'remux' in the release title."""
+    name = (r.get("quality_name") or "").lower()
+    return "remux" in name or "remux" in (r.get("title") or "").lower()
 
 
 def _pct(sorted_vals: list[float], p: float) -> float:
@@ -77,6 +85,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("dataset", type=Path, help="JSONL from gather_training_data.py")
     ap.add_argument("--score", type=float, default=800_000.0, help="group-A score-above threshold")
+    ap.add_argument("--include-remux", action="store_true", help="keep remux (default: excluded)")
     args = ap.parse_args()
 
     def label_a(res: int) -> str:
@@ -88,10 +97,14 @@ def main() -> None:
     a: dict[str, list[float]] = {}  # profile-matched + high score
     b: dict[int, list[float]] = {}  # by result resolution, any profile/score
     skipped_no_runtime = 0
+    skipped_remux = 0
 
     for rec in records:
         target = (rec.get("profile") or {}).get("target_resolution")
         for r in rec.get("releases", []):
+            if not args.include_remux and _is_remux(r):
+                skipped_remux += 1
+                continue
             gbh = r.get("gbh") or 0
             if gbh <= 0:  # unknown runtime: cannot form a size-per-hour value
                 skipped_no_runtime += 1
@@ -106,7 +119,8 @@ def main() -> None:
         "# Size-per-hour (GiB/h) cohorts",
         "",
         f"- dataset: `{args.dataset}`  items: {len(records)}",
-        f"- no filtering (rejected included); {skipped_no_runtime} dropped for unknown runtime",
+        f"- remux: {'INCLUDED' if args.include_remux else f'excluded ({skipped_remux} dropped)'}",
+        f"- rejected releases included; {skipped_no_runtime} dropped for unknown runtime",
         "",
         "## A. Profile-matched, score above threshold",
         "",

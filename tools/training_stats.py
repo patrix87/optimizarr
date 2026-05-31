@@ -41,6 +41,12 @@ def _load(path: Path) -> list[dict]:
     return [json.loads(ln) for ln in lines if ln.strip()]
 
 
+def _is_remux(r: dict) -> bool:
+    """Remux releases (lossless rips, not encodes) skew size stats up; excluded by default."""
+    name = (r.get("quality_name") or "").lower()
+    return "remux" in name or "remux" in (r.get("title") or "").lower()
+
+
 def _bracket(score: float | None, ideal: float) -> str:
     if score is None:
         return "unknown"
@@ -113,6 +119,7 @@ def main() -> None:
         action="store_true",
         help="include hard/temporarily-rejected releases (default: drop them)",
     )
+    ap.add_argument("--include-remux", action="store_true", help="keep remux (default: excluded)")
     args = ap.parse_args()
 
     records = _load(args.dataset)
@@ -122,12 +129,15 @@ def main() -> None:
     score_by_res_bracket: dict[tuple[int, str], list[float]] = {}
     cur_by_res: dict[int, list[float]] = {}
 
-    n_releases = 0
+    n_releases = n_remux = 0
     for rec in records:
         cur = rec.get("current_file")
         if cur and cur.get("gbh"):
             cur_by_res.setdefault(_bucket_res(cur.get("resolution") or 0), []).append(cur["gbh"])
         for r in rec.get("releases", []):
+            if not args.include_remux and _is_remux(r):
+                n_remux += 1
+                continue
             if not args.include_rejected and (r.get("rejections") or r.get("temporarily_rejected")):
                 continue
             gbh = r.get("gbh")
@@ -146,7 +156,8 @@ def main() -> None:
         "",
         f"- dataset: `{args.dataset}`",
         f"- items: {len(records)}  releases analyzed: {n_releases}"
-        f"{' (incl. rejected)' if args.include_rejected else ' (rejected dropped)'}",
+        f"{' (incl. rejected)' if args.include_rejected else ' (rejected dropped)'}"
+        f"{' (incl. remux)' if args.include_remux else f' (remux dropped: {n_remux})'}",
         f"- score_ideal: {args.score_ideal:,.0f}",
         "",
         "## 1. GiB/h per resolution (candidate releases)",
