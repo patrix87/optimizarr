@@ -434,10 +434,24 @@ class OptimizerWorker:
             queue_count = sum(1 for r in records if adapter.is_queue_item_active(r))
         else:
             queue_count = len(records)
+        import_count = sum(1 for r in records if adapter.is_queue_item_pending_import(r))
 
         if not ctx.pool:
             self._build_pool(ctx, now)
         if not ctx.pool:
+            return False
+
+        # Import backlog gate: when too many completed downloads are waiting to import, stop
+        # grabbing so the backlog (which _handle_queue_imports above keeps draining) clears
+        # first. Skipping the grab also skips the slow release search below, so the loop spins
+        # back to the next import sooner.
+        if import_count > self.opt.import_max:
+            logger.debug(
+                "[%s] %d imports pending > max %d; pausing grabs to drain imports",
+                adapter.app,
+                import_count,
+                self.opt.import_max,
+            )
             return False
 
         if queue_count > self.opt.queue_max:

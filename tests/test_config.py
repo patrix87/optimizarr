@@ -331,3 +331,12 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     custom_weights = t.profiles["Custom 1080p"].weights
     assert custom_weights is not None and custom_weights["size"] == 0.4
     assert t.default_preset == "Efficient"
+
+
+def test_optimizer_import_max_default_and_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://radarr:7878")
+    monkeypatch.setenv("RADARR_API_KEY", "abc")
+
+    assert load_config(_write(tmp_path, "")).optimizer.import_max == 2  # default
+    over = load_config(_write(tmp_path, "[optimizer]\nimport_max = 4\n"))
+    assert over.optimizer.import_max == 4

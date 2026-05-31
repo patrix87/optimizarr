@@ -19,6 +19,11 @@ from optimizarr.http import ArrClient
 # bandwidth — used to filter "active" queue items vs. ones stuck waiting for/in import.
 QUEUE_INACTIVE_STATES = {"importPending", "importing", "imported", "importBlocked"}
 
+# trackedDownloadState values for the drainable import backlog: a completed download waiting
+# to be imported (importPending, includes the score-regression downgrades) or one being
+# imported right now (importing). Deliberately excludes importBlocked (manual-only).
+QUEUE_PENDING_IMPORT_STATES = {"importPending", "importing"}
+
 # GET /api/v3/release?movieId=/episodeId= runs a *live* interactive indexer search and only
 # returns once every indexer has answered or timed out — measured at 45-100s in the field,
 # well past the 30s default. Give it a generous ceiling so a normal slow search isn't logged
@@ -111,6 +116,13 @@ class ArrApi:
         if (record.get("status") or "").lower() == "completed":
             return False
         return record.get("trackedDownloadState") not in QUEUE_INACTIVE_STATES
+
+    @staticmethod
+    def is_queue_item_pending_import(record: dict) -> bool:
+        """True when a completed download is waiting to import (importPending) or actively
+        importing (importing): the drainable import backlog the import gate watches.
+        importBlocked is excluded on purpose: it needs manual action and never auto-clears."""
+        return record.get("trackedDownloadState") in QUEUE_PENDING_IMPORT_STATES
 
     def manual_import_candidates(
         self,

@@ -112,6 +112,11 @@ class OptimizerAppConfig:
 class OptimizerConfig:
     enabled: bool = False
     queue_max: int = 5
+    # When more than this many completed downloads are waiting to import (trackedDownloadState
+    # importPending) or actively importing (importing), pause grabbing new releases so the
+    # import backlog drains first. importBlocked is excluded: it needs manual action and would
+    # never clear, freezing grabs forever.
+    import_max: int = 2
     pick_order: str = "random"
     process_interval_seconds: int = 15
     list_refresh_minutes: int = 15
@@ -297,6 +302,7 @@ def parse_optimizer(raw: dict) -> OptimizerConfig:
     return OptimizerConfig(
         enabled=bool(raw.get("enabled", False)),
         queue_max=int(raw.get("queue_max", 5)),
+        import_max=int(raw.get("import_max", 2)),
         pick_order=pick_order,
         process_interval_seconds=process_interval_seconds,
         list_refresh_minutes=int(raw.get("list_refresh_minutes", 15)),

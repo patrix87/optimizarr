@@ -17,13 +17,13 @@ cron_schedule = "0 4 * * *"
 run_on_start = true
 
 [unmonitor.radarr]
-days = 30
+days = 14
 # One of: digitalRelease, physicalRelease, inCinemas, releaseDate, dateAdded
 release_type = "digitalRelease"
 require_cutoff_met = true
 
 [unmonitor.sonarr]
-days = 30
+days = 14
 # One of: airDateUtc, dateAdded
 release_type = "airDateUtc"
 require_cutoff_met = true
@@ -31,8 +31,12 @@ require_cutoff_met = true
 # ===== Optimizer: interval-driven worker that re-picks better releases =====
 [optimizer]
 enabled = true
-# Only process when the download queue has <= queue_max items (0 = empty only).
+# Only grab when the download queue has <= queue_max actively-downloading items (0 = empty only).
 queue_max = 5
+# Pause grabbing while more than import_max completed downloads are waiting to import
+# (importPending) or importing, so the import backlog drains first. importBlocked (manual-only)
+# is not counted, so a stuck manual item can't freeze grabs.
+import_max = 2
 # "random" or "ordered"
 pick_order = "random"
 # Short loop: seconds between processing items — also the wait when the queue is full or
@@ -67,7 +71,7 @@ reevaluate_after_days = 30
 #                              sample, mismatch) are left untouched. Defaults: true on both.
 [optimizer.radarr]
 enabled = true
-min_age_days = 30
+min_age_days = 14
 release_type = ["digitalRelease", "dateAdded"]
 allow_size_increase = true
 allow_quality_downgrade = true
@@ -76,7 +80,7 @@ auto_import_downgrades = true
 
 [optimizer.sonarr]
 enabled = true
-min_age_days = 30
+min_age_days = 14
 release_type = ["airDateUtc", "dateAdded"]
 allow_size_increase = true
 allow_quality_downgrade = true
@@ -97,7 +101,7 @@ resolution_anti_ideal = 480
 # Inclusion: keep the top score cluster down to the first relative drop greater than this.
 score_gap = 0.20
 # Preset used when a profile name matches no preset by keyword.
-default_preset = "Efficient"
+default_preset = "Balanced"
 
 # --- Shared size reference (one objective set, used by every profile) ---
 # Realistic GiB/h per resolution (GB = 1024^3), HDR-assumed and deliberately lean. floor = fake

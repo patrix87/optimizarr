@@ -326,6 +326,74 @@ def test_process_app_once_downgrades_search_timeout_to_warning(tmp_path, caplog)
     assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
+def test_process_app_once_pauses_grabs_when_import_backlog_exceeds_max(tmp_path):
+    # More than import_max (default 2) completed downloads waiting to import -> stop grabbing
+    # so the backlog drains first. The pool item is left untouched (no grab).
+    state = StateManager(str(tmp_path / "s.json"))
+    records = [
+        {
+            "id": i,
+            "movieId": 100 + i,
+            "downloadId": f"d{i}",
+            "status": "completed",
+            "trackedDownloadState": "importPending",
+        }
+        for i in range(3)  # 3 > import_max 2
+    ]
+    adapter = _QueueAdapter(records)
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx.items_by_id = {1: {"id": 1}}
+    ctx.pool = [1]
+    ctx.last_refresh = datetime.now(UTC)  # keep needs_refresh() False
+
+    w = _worker(state)
+    assert w.opt.import_max == 2
+    assert w._process_app_once(ctx) is False  # gate tripped
+    assert ctx.pool == [1]  # pool item not consumed -> nothing grabbed
+    assert 1 not in ctx.evaluated
+
+
+class _GrabQueueAdapter(_ProcessAdapter):
+    """_ProcessAdapter (can grab) plus a canned queue, for gate tests that reach the grab."""
+
+    _queue_id_field = "movieId"
+
+    def __init__(self, records, releases, current_file):
+        super().__init__(releases, current_file)
+        self._records = records
+
+    def queue_items(self):
+        return self._records
+
+
+def test_importblocked_does_not_count_toward_import_gate(tmp_path):
+    # importBlocked is manual-only; it must NOT count toward the gate, else a stuck manual item
+    # freezes grabbing forever. 5 importBlocked records (well over import_max 2) must still grab.
+    state = StateManager(str(tmp_path / "s.json"))
+    records = [
+        {
+            "id": i,
+            "movieId": 100 + i,
+            "status": "completed",
+            "trackedDownloadState": "importBlocked",
+        }
+        for i in range(5)
+    ]
+    adapter = _GrabQueueAdapter(
+        records,
+        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+    )
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx.items_by_id = {1: {"id": 1}}
+    ctx.pool = [1]
+    ctx.last_refresh = datetime.now(UTC)
+
+    w = _worker(state)
+    assert w._process_app_once(ctx) is True  # gate not tripped
+    assert len(adapter.grabbed) == 1  # it grabbed despite 5 blocked items
+
+
 def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     # A list refresh must NOT restart the pass: items already evaluated stay excluded
     # until the whole active set is covered, then the pass resets.

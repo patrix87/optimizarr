@@ -73,6 +73,16 @@ def test_sonarr_current_file_id_fallback():
     assert api.current_file_id({"episodeFileId": 11}) == 11  # no episodeFile, fallback field
 
 
+def test_is_queue_item_pending_import():
+    f = RadarrApi.is_queue_item_pending_import
+    assert f({"trackedDownloadState": "importPending"}) is True
+    assert f({"trackedDownloadState": "importing"}) is True
+    assert f({"trackedDownloadState": "importBlocked"}) is False  # manual-only, excluded
+    assert f({"trackedDownloadState": "downloading"}) is False
+    assert f({"trackedDownloadState": "imported"}) is False
+    assert f({}) is False
+
+
 class _RecordingClient(ArrClient):
     """Captures the GET/POST calls an adapter makes (path, timeout, retry)."""
 

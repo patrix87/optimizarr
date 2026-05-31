@@ -11,12 +11,12 @@ cron_schedule = "0 4 * * *"
 run_on_start = true
 
 [unmonitor.radarr]
-days = 30
+days = 14
 release_type = "digitalRelease"
 require_cutoff_met = true
 
 [unmonitor.sonarr]
-days = 30
+days = 14
 release_type = "airDateUtc"
 require_cutoff_met = true
 
@@ -24,6 +24,7 @@ require_cutoff_met = true
 [optimizer]
 enabled = true
 queue_max = 5
+import_max = 2
 pick_order = "random"
 process_interval_seconds = 15
 list_refresh_minutes = 15
@@ -51,7 +52,7 @@ reevaluate_after_days = 30
 #                              sample, mismatch) are left untouched.
 [optimizer.radarr]
 enabled = true
-min_age_days = 0
+min_age_days = 14
 release_type = ["digitalRelease", "dateAdded"]
 allow_size_increase = true
 allow_quality_downgrade = true
@@ -60,7 +61,7 @@ auto_import_downgrades = true
 
 [optimizer.sonarr]
 enabled = true
-min_age_days = 0
+min_age_days = 14
 release_type = ["airDateUtc", "dateAdded"]
 allow_size_increase = true
 allow_quality_downgrade = true
@@ -76,7 +77,7 @@ resolution_anti_ideal = 480
 # gap-cut inclusion: keep the top score cluster down to the first relative drop greater than this.
 score_gap = 0.20
 # Preset used when a profile name matches no preset by keyword.
-default_preset = "Efficient"
+default_preset = "Balanced"
 
 # ----- Shared size reference (one objective set, used by ALL profiles) -----
 # Realistic GiB/h per resolution (GB = 1024^3 -> GiB), HDR-assumed and deliberately lean (this
