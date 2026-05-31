@@ -230,7 +230,12 @@ def main() -> None:
     ap.add_argument("--config", default="config.toml", help="path to config.toml")
     ap.add_argument("--app", default="radarr", choices=["radarr", "sonarr"])
     ap.add_argument("--limit", type=int, default=5, help="max items to evaluate (rate limits!)")
-    ap.add_argument("--ids", type=int, nargs="*", help="specific movie/series ids to evaluate")
+    ap.add_argument(
+        "--ids",
+        type=int,
+        nargs="*",
+        help="specific items to evaluate, by internal id or tmdb/tvdb id",
+    )
     ap.add_argument("--sleep", type=float, default=3.0, help="seconds between items")
     ap.add_argument("--seed", type=int, help="seed the random sample for a reproducible run")
     args = ap.parse_args()
@@ -244,10 +249,24 @@ def main() -> None:
     api = build_client(args.app, conn)
     api.refresh_profiles()
 
-    items = [it for it in api.list_items() if api.has_file(it)]
+    all_items = api.list_items()
+    items = [it for it in all_items if api.has_file(it)]
     if args.ids:
+        # Match against the internal id AND the external id (tmdbId/tvdbId), since people
+        # usually copy the external id from the *arr UI. Warn on anything that matched
+        # nothing or has no file, instead of silently dropping it.
         wanted = set(args.ids)
-        items = [it for it in items if api.item_id(it) in wanted]
+
+        def item_keys(it: dict) -> set[int]:
+            return {it.get("id"), it.get("tmdbId"), it.get("tvdbId")} - {None}
+
+        items = [it for it in items if wanted & item_keys(it)]
+        matched = wanted & {k for it in all_items for k in item_keys(it)}
+        for missing in sorted(wanted - matched):
+            print(f"[warn] id {missing}: no movie/series with that id (internal or tmdb/tvdb)")
+        with_file = wanted & {k for it in items for k in item_keys(it)}
+        for nofile in sorted(matched - with_file):
+            print(f"[warn] id {nofile}: exists but has no downloaded file; skipped")
     else:
         # Random sample so repeated runs don't always show the same first movies.
         random.Random(args.seed).shuffle(items)
