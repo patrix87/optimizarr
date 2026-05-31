@@ -21,20 +21,27 @@ Options:
                      as the worker. Connection/secrets still come from the env (.env).
     --app NAME       Which app to evaluate: radarr or sonarr (default: radarr). Must be enabled
                      in the environment (its URL + API key set).
-    --limit N        Max items to evaluate (default: 5). Ignored when --ids is given. Kept small
-                     on purpose: each item is a live, rate-limited indexer search.
-    --ids ID [ID...] Evaluate exactly these items, by internal id OR external id (tmdb/tvdb) — so
-                     you can paste the id straight from the *arr UI. Skips the random sample and
-                     --limit. Warns on any id that is unknown or has no downloaded file.
+    --limit N        Max items to evaluate (default: 5). Caps EVERY path, including --tmdb/--ids
+                     (an over-long id list is truncated). Each item is a live, rate-limited
+                     indexer search, hence the small default.
+    --tmdb ID [ID..] Evaluate these TMDB ids (Sonarr: TVDB ids) — the id in the *arr movie URL,
+                     so you can paste it straight from the browser. The recommended selector.
+    --ids ID [ID...] Evaluate these *internal* Radarr/Sonarr ids (the DB primary key). A separate
+                     id space from --tmdb; use this only if you specifically have the internal id.
+                     --tmdb and --ids are matched independently and may be combined.
     --sleep SECONDS  Delay between items (default: 3.0), to stay gentle on the indexers.
-    --seed N         Seed the random sample for a reproducible run (no effect with --ids).
+    --seed N         Seed the random sample for a reproducible run (no effect with --tmdb/--ids).
+
+Either selector skips the random sample (but still obeys --limit) and warns on any id that is
+unknown or has no downloaded file (those are skipped) instead of failing silently. Matching by
+--tmdb does not call TMDB: the id is already a field on each item from the one *arr list call.
 
 Examples:
     # 5 random movies
     uv run --env-file .env python tools/cutoff_viz.py --config config.toml
 
-    # specific movies (internal or TMDB id), no sampling
-    uv run --env-file .env python tools/cutoff_viz.py --config config.toml --ids 665 38356
+    # specific movies by TMDB id (the number in the *arr URL), no sampling
+    uv run --env-file .env python tools/cutoff_viz.py --config config.toml --tmdb 38356 1858
 
     # a reproducible sample of 10
     uv run --env-file .env python tools/cutoff_viz.py --config config.toml --limit 10 --seed 1
@@ -254,10 +261,18 @@ def main() -> None:
     ap.add_argument("--app", default="radarr", choices=["radarr", "sonarr"])
     ap.add_argument("--limit", type=int, default=5, help="max items to evaluate (rate limits!)")
     ap.add_argument(
+        "--tmdb",
+        type=int,
+        nargs="*",
+        default=[],
+        help="evaluate these TMDB ids (the id in the *arr movie URL); Sonarr: TVDB ids",
+    )
+    ap.add_argument(
         "--ids",
         type=int,
         nargs="*",
-        help="specific items to evaluate, by internal id or tmdb/tvdb id",
+        default=[],
+        help="evaluate these internal Radarr/Sonarr ids",
     )
     ap.add_argument("--sleep", type=float, default=3.0, help="seconds between items")
     ap.add_argument("--seed", type=int, help="seed the random sample for a reproducible run")
@@ -274,22 +289,40 @@ def main() -> None:
 
     all_items = api.list_items()
     items = [it for it in all_items if api.has_file(it)]
-    if args.ids:
-        # Match against the internal id AND the external id (tmdbId/tvdbId), since people
-        # usually copy the external id from the *arr UI. Warn on anything that matched
-        # nothing or has no file, instead of silently dropping it.
-        wanted = set(args.ids)
+    if args.tmdb or args.ids:
+        # Internal id and external id (tmdb/tvdb) are separate id spaces and can collide, so they
+        # are matched independently. --tmdb is the one to use: it's the id in the *arr movie URL.
+        # Warn (per id space) on anything unknown or with no file, instead of silently dropping it.
+        want_ext, want_internal = set(args.tmdb), set(args.ids)
 
-        def item_keys(it: dict) -> set[int]:
-            return {it.get("id"), it.get("tmdbId"), it.get("tvdbId")} - {None}
+        def ext_id(it: dict) -> int | None:
+            return it.get("tmdbId") or it.get("tvdbId")
 
-        items = [it for it in items if wanted & item_keys(it)]
-        matched = wanted & {k for it in all_items for k in item_keys(it)}
-        for missing in sorted(wanted - matched):
-            print(f"[warn] id {missing}: no movie/series with that id (internal or tmdb/tvdb)")
-        with_file = wanted & {k for it in items for k in item_keys(it)}
-        for nofile in sorted(matched - with_file):
-            print(f"[warn] id {nofile}: exists but has no downloaded file; skipped")
+        items = [it for it in items if api.item_id(it) in want_internal or ext_id(it) in want_ext]
+
+        def warn(label: str, wanted: set[int], present: set[int], with_file: set[int]) -> None:
+            for missing in sorted(wanted - present):
+                print(f"[warn] {label} {missing}: no such item")
+            for nofile in sorted((wanted & present) - with_file):
+                print(f"[warn] {label} {nofile}: exists but has no downloaded file; skipped")
+
+        warn(
+            "tmdb/tvdb id",
+            want_ext,
+            {e for it in all_items if (e := ext_id(it)) is not None},
+            {e for it in items if (e := ext_id(it)) is not None},
+        )
+        warn(
+            "internal id",
+            want_internal,
+            {api.item_id(it) for it in all_items},
+            {api.item_id(it) for it in items},
+        )
+        # --limit caps every path: each item is a live indexer search, so an over-long id list
+        # shouldn't fire dozens of them.
+        if len(items) > args.limit:
+            print(f"[warn] {len(items)} items selected; capping at --limit {args.limit}")
+            items = items[: args.limit]
     else:
         # Random sample so repeated runs don't always show the same first movies.
         random.Random(args.seed).shuffle(items)
