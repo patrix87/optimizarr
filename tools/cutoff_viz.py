@@ -178,6 +178,8 @@ def analyze(
 
     return {
         "resolved": resolved,
+        "profile_name": profile_name,
+        "target_res": target_res,
         "current": {"closeness": cur_clo, **cur_raw},
         "rows": rows,
         "gap_cutoff_score": gap_cutoff_score,
@@ -196,10 +198,13 @@ def render_item(api: ArrApi, item: dict, analysis: dict, gap: float) -> list[str
     label = api.label(item)
     prof = analysis["resolved"]
     cur = analysis["current"]
+    target = analysis["target_res"]
+    target_s = f"{target}p" if target else "?"
     md = [
         f"### {label}",
         "",
-        f"- profile pick method: `{prof.pick}`  weights: `{prof.weights}`",
+        f"- quality profile: `{analysis['profile_name'] or '?'}` (target {target_s})",
+        f"- resolved preset: pick `{prof.pick}`, weights `{prof.weights}`",
         f"- current file: {_fmt_side(cur)}",
         f"- legal candidates after gate: **{analysis['n_legal']}**",
         "",
