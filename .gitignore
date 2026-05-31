@@ -10,3 +10,4 @@ build/
 *.egg-info/
 reports/
 results*
+config.toml
