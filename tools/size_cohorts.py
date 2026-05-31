@@ -2,15 +2,16 @@
 
 Rejected/temporarily-rejected releases are INCLUDED (no quality filtering). Dropped by default:
 raw sources (remux + BR-DISK, which inflate size; --include-raw keeps them), non-H.264/H.265
-codecs (AV1/XviD/DivX/VC-1/etc; --any-codec keeps them), and releases with an unknown runtime
-(gbh = 0). Each drop count is reported.
+codecs (AV1/XviD/DivX/VC-1/etc; --any-codec keeps them), negative-score releases
+(--include-negative keeps them), and releases with an unknown runtime (gbh = 0). Each drop count
+is reported.
 
 Cohorts:
   A. Profile-matched, high score: target profile resolution == result resolution, score > --score
      (default 800000). One row for 2160p, one for 1080p.
   B. By result resolution, any profile, any score: 2160p, 1080p, 720p, 480p.
 
-Stats per cohort: n, mean, median, p10, p25, p75, p90, min, max.
+Stats per cohort: n, mean, median, p5, p10, p25, p75, p90, p95, min, max.
 
 Run:  uv run python tools/size_cohorts.py reports/training_data_radarr.jsonl
 Writes a timestamped Markdown report under ./reports/ and prints it.
@@ -71,10 +72,12 @@ def _summary(values: list[float]) -> dict:
         "n": n,
         "mean": st.mean(s),
         "median": st.median(s),
+        "p5": _pct(s, 0.05),
         "p10": _pct(s, 0.10),
         "p25": _pct(s, 0.25),
         "p75": _pct(s, 0.75),
         "p90": _pct(s, 0.90),
+        "p95": _pct(s, 0.95),
         "min": s[0],
         "max": s[-1],
     }
@@ -82,16 +85,17 @@ def _summary(values: list[float]) -> dict:
 
 def _row(label: str, s: dict) -> str:
     if s["n"] == 0:
-        return f"| {label} | 0 |  |  |  |  |  |  |  |  |"
+        return f"| {label} | 0 |" + "  |" * 11
     return (
-        f"| {label} | {s['n']} | {s['mean']:.2f} | {s['median']:.2f} | {s['p10']:.2f} | "
-        f"{s['p25']:.2f} | {s['p75']:.2f} | {s['p90']:.2f} | {s['min']:.2f} | {s['max']:.2f} |"
+        f"| {label} | {s['n']} | {s['mean']:.2f} | {s['median']:.2f} | {s['p5']:.2f} | "
+        f"{s['p10']:.2f} | {s['p25']:.2f} | {s['p75']:.2f} | {s['p90']:.2f} | {s['p95']:.2f} | "
+        f"{s['min']:.2f} | {s['max']:.2f} |"
     )
 
 
 HEADER = (
-    "| cohort | n | mean | median | p10 | p25 | p75 | p90 | min | max |\n"
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    "| cohort | n | mean | median | p5 | p10 | p25 | p75 | p90 | p95 | min | max |\n"
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
 )
 
 
@@ -103,6 +107,7 @@ def main() -> None:
     ap.add_argument(
         "--any-codec", action="store_true", help="keep all codecs (default: H.264/H.265)"
     )
+    ap.add_argument("--include-negative", action="store_true", help="keep score < 0 releases")
     args = ap.parse_args()
 
     def label_a(res: int) -> str:
@@ -113,7 +118,7 @@ def main() -> None:
     # cohort name -> list of gbh
     a: dict[str, list[float]] = {}  # profile-matched + high score
     b: dict[int, list[float]] = {}  # by result resolution, any profile/score
-    skipped_no_runtime = skipped_raw = skipped_codec = 0
+    skipped_no_runtime = skipped_raw = skipped_codec = skipped_neg = 0
 
     for rec in records:
         target = (rec.get("profile") or {}).get("target_resolution")
@@ -124,12 +129,15 @@ def main() -> None:
             if not args.any_codec and _codec(r) == "other":
                 skipped_codec += 1
                 continue
+            score = r.get("score")
+            if not args.include_negative and score is not None and score < 0:
+                skipped_neg += 1
+                continue
             gbh = r.get("gbh") or 0
             if gbh <= 0:  # unknown runtime: cannot form a size-per-hour value
                 skipped_no_runtime += 1
                 continue
             res = r.get("resolution") or 0
-            score = r.get("score")
             b.setdefault(res, []).append(gbh)
             if target == res and res in (2160, 1080) and score is not None and score > args.score:
                 a.setdefault(label_a(res), []).append(gbh)
@@ -141,6 +149,7 @@ def main() -> None:
         f"- raw sources (remux + BR-DISK): "
         f"{'INCLUDED' if args.include_raw else f'excluded ({skipped_raw} dropped)'}",
         f"- codec: {'ALL' if args.any_codec else f'H.264/H.265 only ({skipped_codec} dropped)'}",
+        f"- negative scores: {'INCLUDED' if args.include_negative else f'dropped ({skipped_neg})'}",
         f"- rejected releases included; {skipped_no_runtime} dropped for unknown runtime",
         "",
         "## A. Profile-matched, score above threshold",

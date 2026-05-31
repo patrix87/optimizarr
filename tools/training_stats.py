@@ -133,6 +133,7 @@ def main() -> None:
     ap.add_argument(
         "--any-codec", action="store_true", help="keep all codecs (default: H.264/H.265)"
     )
+    ap.add_argument("--include-negative", action="store_true", help="keep score < 0 releases")
     args = ap.parse_args()
 
     records = _load(args.dataset)
@@ -142,7 +143,7 @@ def main() -> None:
     score_by_res_bracket: dict[tuple[int, str], list[float]] = {}
     cur_by_res: dict[int, list[float]] = {}
 
-    n_releases = n_raw = n_codec = 0
+    n_releases = n_raw = n_codec = n_neg = 0
     for rec in records:
         cur = rec.get("current_file")
         if cur and cur.get("gbh"):
@@ -153,6 +154,10 @@ def main() -> None:
                 continue
             if not args.any_codec and _codec(r) == "other":
                 n_codec += 1
+                continue
+            score = r.get("score")
+            if not args.include_negative and score is not None and score < 0:
+                n_neg += 1
                 continue
             if not args.include_rejected and (r.get("rejections") or r.get("temporarily_rejected")):
                 continue
@@ -174,7 +179,8 @@ def main() -> None:
         f"- items: {len(records)}  releases analyzed: {n_releases}"
         f"{' (incl. rejected)' if args.include_rejected else ' (rejected dropped)'}",
         f"- raw (remux+BR-DISK): {'INCLUDED' if args.include_raw else f'dropped ({n_raw})'}; "
-        f"codec: {'ALL' if args.any_codec else f'H.264/H.265 only (dropped {n_codec})'}",
+        f"codec: {'ALL' if args.any_codec else f'H.264/H.265 only (dropped {n_codec})'}; "
+        f"negative scores: {'INCLUDED' if args.include_negative else f'dropped ({n_neg})'}",
         f"- score_ideal: {args.score_ideal:,.0f}",
         "",
         "## 1. GiB/h per resolution (candidate releases)",
