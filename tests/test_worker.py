@@ -361,11 +361,16 @@ class _QueueAdapter(ArrApi):
         self._candidates = candidates or {}
         self._raises: dict[str, str] = raises or {}
         self.imports: list[tuple[list[dict], str]] = []
+        self.candidate_calls: list[str] = []
 
     def queue_items(self):
         return self._records
 
+    def set_records(self, records):
+        self._records = records
+
     def manual_import_candidates(self, download_id, *, timeout=None, retry=True):
+        self.candidate_calls.append(download_id)
         if download_id in self._raises:
             raise RuntimeError(self._raises[download_id])
         return self._candidates.get(download_id, [])
@@ -412,6 +417,67 @@ def test_handle_queue_imports_force_imports_downgrades(tmp_path):
     w._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
     assert adapter.imports == [([candidate], "auto")]
+    # The command is async: the item is recorded as pending, NOT yet declared imported.
+    assert ctx.import_slot.is_pending("dl1")
+
+
+def test_handle_queue_imports_confirms_only_after_item_leaves_queue(tmp_path, caplog):
+    # The premature/duplicate "auto-imported" bug: success must be logged once, and only once
+    # the item actually leaves the queue, not at POST time.
+    state = StateManager(str(tmp_path / "s.json"))
+    record = _downgrade_record()
+    candidate = {"path": "/x.mkv", "movie": {"id": 42}, "rejections": []}
+    adapter = _QueueAdapter([record], candidates={"dl1": [candidate]})
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    w = _worker(state)
+
+    with caplog.at_level(logging.INFO):
+        # Tick 1: submit. Item still queued -> no "auto-imported" yet.
+        w._handle_queue_imports(ctx)
+        _wait_for_slot(ctx)
+        assert not any("auto-imported" in r.getMessage() for r in caplog.records)
+
+        # Tick 2: item STILL in queue (import pending) -> must NOT re-submit, still no claim.
+        w._handle_queue_imports(ctx)
+        _wait_for_slot(ctx)
+        assert adapter.imports == [([candidate], "auto")]  # only one POST, no re-submission
+        assert not any("auto-imported" in r.getMessage() for r in caplog.records)
+
+        # Tick 3: item has left the queue -> confirmed import, logged exactly once.
+        caplog.clear()
+        adapter.set_records([])
+        w._handle_queue_imports(ctx)
+        _wait_for_slot(ctx)
+
+    confirmed = [r for r in caplog.records if "auto-imported" in r.getMessage()]
+    assert len(confirmed) == 1
+    assert "Movie.2024.2160p.WEB.x265" in confirmed[0].getMessage()
+    assert not ctx.import_slot.is_pending("dl1")
+
+
+def test_handle_queue_imports_marks_nonimportable_skip_no_resubmit(tmp_path):
+    # A non-score-regression rejection (Sample) is left alone AND skipped for the session, so
+    # the slow candidate scan isn't repeated every tick.
+    state = StateManager(str(tmp_path / "s.json"))
+    candidate = {
+        "path": "/x.mkv",
+        "rejections": [
+            {"reason": "Not an upgrade for existing movie file(s)"},
+            {"reason": "Sample"},
+        ],
+    }
+    adapter = _QueueAdapter([_downgrade_record()], candidates={"dl1": [candidate]})
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    w = _worker(state)
+
+    w._handle_queue_imports(ctx)
+    _wait_for_slot(ctx)
+    w._handle_queue_imports(ctx)  # second tick
+    _wait_for_slot(ctx)
+
+    assert adapter.imports == []
+    assert ctx.import_slot.should_skip("dl1")
+    assert adapter.candidate_calls == ["dl1"]  # scanned once, then skipped
 
 
 def test_handle_queue_imports_dry_run_does_not_post(tmp_path):
@@ -544,8 +610,9 @@ def test_run_manual_import_returns_false_on_get_failure(tmp_path):
         records=[_downgrade_record()],
         raises={"dl1": "simulated timeout"},
     )
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
     w = _worker(state)
-    assert w._run_manual_import(adapter, "Movie (2024)", "dl1") is False
+    assert w._run_manual_import(ctx, "Movie (2024)", "dl1") is False
     assert adapter.imports == []
 
 

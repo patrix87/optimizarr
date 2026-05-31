@@ -67,13 +67,47 @@ class _ImportSlot:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._fail_counts: dict[str, int] = {}
+        # downloadId -> title for imports we've POSTed but not yet confirmed. The ManualImport
+        # command is async (Radarr can take many minutes to actually import a large file), so a
+        # POST does NOT mean "imported". We hold the id here and only declare success once the
+        # item has left the queue (reconcile_completed), and we never re-submit while it's here.
+        self._pending: dict[str, str] = {}
+        # downloadIds we've decided not to touch again this session (non-score-regression
+        # rejections). Cleared only on restart.
+        self._skip: set[str] = set()
 
     def busy(self) -> bool:
         with self._lock:
             return self._thread is not None and self._thread.is_alive()
 
     def should_skip(self, download_id: str) -> bool:
-        return self._fail_counts.get(download_id, 0) >= _MANUAL_IMPORT_MAX_FAILS
+        with self._lock:
+            return (
+                download_id in self._skip
+                or self._fail_counts.get(download_id, 0) >= _MANUAL_IMPORT_MAX_FAILS
+            )
+
+    def mark_skip(self, download_id: str) -> None:
+        with self._lock:
+            self._skip.add(download_id)
+
+    def is_pending(self, download_id: str) -> bool:
+        with self._lock:
+            return download_id in self._pending
+
+    def mark_submitted(self, download_id: str, title: str) -> None:
+        with self._lock:
+            self._pending[download_id] = title
+
+    def reconcile_completed(self, queue_download_ids: set[str]) -> list[str]:
+        """Drop pending downloadIds that have left the queue (those actually imported) and
+        return their titles so the caller can log a *confirmed* import. An item Radarr refuses
+        stays queued, so it stays pending (silent) and is never re-submitted or falsely claimed."""
+        with self._lock:
+            done = [(d, t) for d, t in self._pending.items() if d not in queue_download_ids]
+            for d, _ in done:
+                del self._pending[d]
+        return [t for _, t in done]
 
     def submit(self, download_id: str, target: Callable[[], bool]) -> bool:
         """Spawn target() in a daemon thread if the slot is free. target() returns True on
@@ -249,13 +283,21 @@ class OptimizerWorker:
         (virus / sample / mismatch) are left untouched."""
         if not ctx.app_cfg.auto_import_downgrades:
             return
-        if ctx.import_slot.busy():
-            return
         adapter = ctx.adapter
         try:
             records = adapter.queue_items()
         except Exception:
             logger.exception("[%s] queue fetch failed during auto-import scan", adapter.app)
+            return
+
+        # Confirm earlier submissions: any pending downloadId no longer in the queue actually
+        # imported (Radarr removes the queue item on a real import). Log it now, confirmed,
+        # instead of optimistically at POST time.
+        queue_ids = {r["downloadId"] for r in records if r.get("downloadId")}
+        for title in ctx.import_slot.reconcile_completed(queue_ids):
+            logger.info("[%s] auto-imported downgrade %s", adapter.app, title)
+
+        if ctx.import_slot.busy():
             return
 
         target = next(
@@ -265,6 +307,7 @@ class OptimizerWorker:
                 if _is_score_regression(r)
                 and r.get("downloadId")
                 and not ctx.import_slot.should_skip(r["downloadId"])
+                and not ctx.import_slot.is_pending(r["downloadId"])  # already awaiting import
             ),
             None,
         )
@@ -283,17 +326,28 @@ class OptimizerWorker:
             return
 
         ctx.import_slot.submit(
-            download_id, lambda: self._run_manual_import(adapter, title, download_id)
+            download_id, lambda: self._run_manual_import(ctx, title, download_id)
         )
 
-    def _run_manual_import(self, adapter: ArrApi, title: str, download_id: str) -> bool:
-        """Inside the spawned daemon thread: GET candidates, filter to importable
-        downgrades, POST manualimport. Returns True on success (including 'no work to do'),
-        False on transport failure so the slot's failure counter ticks up."""
+    def _run_manual_import(self, ctx: _AppContext, title: str, download_id: str) -> bool:
+        """Inside the spawned daemon thread: GET candidates, filter to importable downgrades,
+        POST the ManualImport command. Returns True on a clean outcome, False on a transport
+        failure so the slot's failure counter ticks up.
+
+        Crucially it does NOT log "auto-imported" here: the command is async, so we only record
+        the submission and let _handle_queue_imports confirm the import once the item leaves the
+        queue. That stops the same item being re-submitted (and falsely re-announced) every tick
+        while Radarr is still importing it."""
+        adapter = ctx.adapter
         try:
             candidates = adapter.manual_import_candidates(
                 download_id, timeout=_MANUAL_IMPORT_TIMEOUT_SEC, retry=False
             )
+        except ArrTimeout as e:
+            logger.warning(
+                "[%s] candidate scan for %s timed out; will retry later (%s)", adapter.app, title, e
+            )
+            return False
         except Exception:
             logger.exception("[%s] manualimport GET failed for %s", adapter.app, title)
             return False
@@ -301,11 +355,12 @@ class OptimizerWorker:
         importable = [c for c in candidates if _is_importable_downgrade(c)]
         if not importable:
             logger.info(
-                "[%s] no importable candidates for downgrade %s (downloadId=%s); leaving alone",
+                "[%s] no importable candidates for downgrade %s (downloadId=%s); skipping",
                 adapter.app,
                 title,
                 download_id,
             )
+            ctx.import_slot.mark_skip(download_id)
             return True
 
         try:
@@ -315,12 +370,18 @@ class OptimizerWorker:
                 timeout=_MANUAL_IMPORT_TIMEOUT_SEC,
                 retry=False,
             )
+        except ArrTimeout as e:
+            logger.warning(
+                "[%s] import submit for %s timed out; will retry later (%s)", adapter.app, title, e
+            )
+            return False
         except Exception:
             logger.exception("[%s] manualimport POST failed for %s", adapter.app, title)
             return False
 
+        ctx.import_slot.mark_submitted(download_id, title)
         logger.info(
-            "[%s] auto-imported downgrade %s (%d file(s))",
+            "[%s] submitted import for downgrade %s (%d file(s)); awaiting import",
             adapter.app,
             title,
             len(importable),
