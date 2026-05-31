@@ -8,13 +8,36 @@ grabs, imports, unmonitors, or writes state — there is no code path here that 
 It drives the real config (config.toml) and connection (.env), so the numbers match what the
 worker would see.
 
+A live `/api/v3/release` search is a slow interactive indexer call and is rate-limited, so this
+processes only a small random sample by default and sleeps between items. Writes a timestamped
+Markdown report under ./reports/.
+
 Run (from the repo root):
 
     uv run --env-file .env python tools/cutoff_viz.py --config config.toml --limit 5
 
-A live `/api/v3/release` search is a slow interactive indexer call and is rate-limited, so this
-processes only a small sample by default (--limit) and sleeps between items. Use --ids to target
-specific movie ids. Writes a timestamped Markdown report under ./reports/.
+Options:
+    --config PATH    Path to config.toml (default: config.toml). Layered on defaults.toml, same
+                     as the worker. Connection/secrets still come from the env (.env).
+    --app NAME       Which app to evaluate: radarr or sonarr (default: radarr). Must be enabled
+                     in the environment (its URL + API key set).
+    --limit N        Max items to evaluate (default: 5). Ignored when --ids is given. Kept small
+                     on purpose: each item is a live, rate-limited indexer search.
+    --ids ID [ID...] Evaluate exactly these items, by internal id OR external id (tmdb/tvdb) — so
+                     you can paste the id straight from the *arr UI. Skips the random sample and
+                     --limit. Warns on any id that is unknown or has no downloaded file.
+    --sleep SECONDS  Delay between items (default: 3.0), to stay gentle on the indexers.
+    --seed N         Seed the random sample for a reproducible run (no effect with --ids).
+
+Examples:
+    # 5 random movies
+    uv run --env-file .env python tools/cutoff_viz.py --config config.toml
+
+    # specific movies (internal or TMDB id), no sampling
+    uv run --env-file .env python tools/cutoff_viz.py --config config.toml --ids 665 38356
+
+    # a reproducible sample of 10
+    uv run --env-file .env python tools/cutoff_viz.py --config config.toml --limit 10 --seed 1
 """
 
 from __future__ import annotations
