@@ -20,6 +20,7 @@ specific movie ids. Writes a timestamped Markdown report under ./reports/.
 from __future__ import annotations
 
 import argparse
+import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -231,6 +232,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=5, help="max items to evaluate (rate limits!)")
     ap.add_argument("--ids", type=int, nargs="*", help="specific movie/series ids to evaluate")
     ap.add_argument("--sleep", type=float, default=3.0, help="seconds between items")
+    ap.add_argument("--seed", type=int, help="seed the random sample for a reproducible run")
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -246,7 +248,10 @@ def main() -> None:
     if args.ids:
         wanted = set(args.ids)
         items = [it for it in items if api.item_id(it) in wanted]
-    items = items[: args.limit]
+    else:
+        # Random sample so repeated runs don't always show the same first movies.
+        random.Random(args.seed).shuffle(items)
+        items = items[: args.limit]
 
     header = [
         "# Candidate / score-gap cutoff visualization",
