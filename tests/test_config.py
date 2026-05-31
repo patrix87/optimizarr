@@ -40,7 +40,7 @@ def test_radarr_only_with_defaults(monkeypatch, tmp_path):
     assert um.enabled is True
     assert um.cron_schedule == "0 4 * * *"
     assert um.run_on_start is True
-    assert um.radarr.days == 30
+    assert um.radarr.days == 14
     assert um.radarr.release_type == "digitalRelease"
     assert um.radarr.require_cutoff_met is True
 
@@ -190,7 +190,7 @@ def test_optimizer_app_age_gate_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     config = load_config(_write(tmp_path, ""))
-    assert config.optimizer.radarr.min_age_days == 0
+    assert config.optimizer.radarr.min_age_days == 14
     # Dual-gate by default: release date AND dateAdded both must pass.
     assert config.optimizer.radarr.release_type == ["digitalRelease", "dateAdded"]
     assert config.optimizer.sonarr.release_type == ["airDateUtc", "dateAdded"]
@@ -330,7 +330,7 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     assert t.profiles["2160p Remux"].preset == "Remux"
     custom_weights = t.profiles["Custom 1080p"].weights
     assert custom_weights is not None and custom_weights["size"] == 0.4
-    assert t.default_preset == "Efficient"
+    assert t.default_preset == "Balanced"
 
 
 def test_optimizer_import_max_default_and_override(monkeypatch, tmp_path):
