@@ -96,8 +96,10 @@ without changing anything.
 Two parts:
 
 - **Environment** holds only secrets, URLs, and paths.
-- **`config.toml`** holds all behavior, layered on top of the bundled `defaults.toml`, so you
-  only set what you want to change. Copy [`config.example.toml`](config.example.toml) and edit.
+- **`config.toml`** holds all behavior, layered on top of the bundled
+  [`defaults.toml`](optimizarr/defaults.toml), so you only set what you want to change.
+  `defaults.toml` documents every option inline: read it, then copy just the keys you want to
+  change into your `config.toml`. With no `config.toml` at all, the defaults are used as-is.
 
 ### Environment variables
 
@@ -112,8 +114,8 @@ If neither Radarr nor Sonarr is configured, the container exits 1.
 
 ### The bits you will actually touch
 
-The defaults are sensible; most setups only adjust a handful of keys (all documented inline in
-[`config.example.toml`](config.example.toml)):
+The defaults are sensible; most setups only adjust a handful of keys (every key is documented
+inline in [`defaults.toml`](optimizarr/defaults.toml)):
 
 | Key | What it does |
 | --- | --- |
@@ -137,7 +139,8 @@ uv run ruff format --check .
 
 # Run against a real Radarr/Sonarr without Docker:
 cp .env.example .env             # fill in URLs + API keys
-cp config.example.toml config.toml
+# Optionally create a config.toml with any overrides (it layers on optimizarr/defaults.toml,
+# which documents every option). With no config.toml, the built-in defaults are used.
 # optimizarr reads /config/config.toml and writes /data/state.json by default;
 # to run outside Docker, edit CONFIG_PATH / STATE_PATH at the top of optimizarr/config.py.
 uv run --env-file .env python -m optimizarr
