@@ -22,6 +22,7 @@ import random
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 from optimizarr.arr import ArrApi, build_client
 from optimizarr.config import Config
@@ -57,7 +58,7 @@ _MANUAL_IMPORT_MAX_FAILS = 3
 # pick_order -> (item sort key, reverse). "random" is handled separately (shuffle). The keys
 # read already-fetched item fields via the adapter (no extra HTTP); see ArrApi.label /
 # file_size / date_added / release_date. label() is casefolded for case-insensitive A->Z.
-_PICK_ORDER_KEYS: dict[str, tuple[Callable[[ArrApi, dict], object], bool]] = {
+_PICK_ORDER_KEYS: dict[str, tuple[Callable[[ArrApi, dict], Any], bool]] = {
     "alphabetical_asc": (lambda a, it: a.label(it).casefold(), False),
     "alphabetical_desc": (lambda a, it: a.label(it).casefold(), True),
     "size_asc": (lambda a, it: a.file_size(it), False),

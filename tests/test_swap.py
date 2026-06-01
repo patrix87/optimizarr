@@ -118,6 +118,7 @@ def test_optimizer_converges_no_oscillation_on_random_pools():
                 d = decide(T, pool, 2.0, f"2160p {profile}", 2160, current_file=cur)
                 if d.action == "HOLD":
                     break
+                assert d.pick is not None and d.current is not None and d.release is not None
                 pick_clo = d.pick["closeness"]
                 cur_clo = d.current["closeness"]
                 if cur_clo is not None:
