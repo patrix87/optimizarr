@@ -395,6 +395,26 @@ def test_importblocked_does_not_count_toward_import_gate(tmp_path):
     assert len(adapter.grabbed) == 1  # it grabbed despite 5 blocked items
 
 
+def test_process_app_once_consumes_head_of_pool_first(tmp_path):
+    # Regression: order_pool returns the pool in processing order (index 0 is what the
+    # pick_order wants first, e.g. the biggest file for size_desc). The worker must consume
+    # the head, not the tail — popping the tail inverted every order.
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _GrabQueueAdapter(
+        records=[],
+        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+    )
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx.items_by_id = {10: {"id": 10}, 20: {"id": 20}, 30: {"id": 30}}
+    ctx.pool = [10, 20, 30]
+    ctx.last_refresh = datetime.now(UTC)
+
+    w = _worker(state)
+    w._process_app_once(ctx)
+    assert ctx.pool == [20, 30]  # head (10) processed first, tail untouched
+
+
 def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     # A list refresh must NOT restart the pass: items already evaluated stay excluded
     # until the whole active set is covered, then the pass resets.

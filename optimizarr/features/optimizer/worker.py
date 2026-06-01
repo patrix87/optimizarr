@@ -485,7 +485,9 @@ class OptimizerWorker:
             )
             return False
 
-        item_id = ctx.pool.pop()
+        # Consume from the front: order_pool returns the pool in processing order (index 0 is
+        # the item the pick_order wants first, e.g. the biggest file for size_desc).
+        item_id = ctx.pool.pop(0)
         if item_id in queue_ids:
             return False  # already downloading; skip and move on
 
