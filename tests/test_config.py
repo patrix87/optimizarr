@@ -311,7 +311,7 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     assert t.presets["Compact"].pick == "min_size"
     # per-preset absolute size tables (floor, target, bloat)
     assert t.presets["Balanced"].reference[2160] == (4.5, 9.0, 16.0)
-    assert t.presets["Efficient"].reference[2160] == (4.0, 7.5, 14.0)
+    assert t.presets["Efficient"].reference[2160] == (3.5, 6.5, 14.0)
     assert t.presets["Remux"].reference[2160] == (15.0, 35.0, 80.0)
     # swap margin default
     assert t.default_min_closeness_gain == 0.02

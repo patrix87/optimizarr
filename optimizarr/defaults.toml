@@ -142,10 +142,10 @@ resolution = 0.10
 size = 0.50
 pick = "topsis"
 [optimizer.topsis.presets.Efficient.reference]
-"2160" = { floor = 4.0, target = 7.5, bloat = 14.0 }
-"1080" = { floor = 1.2, target = 3.0, bloat = 7.0 }
-"720"  = { floor = 0.4, target = 1.2, bloat = 3.5 }
-"480"  = { floor = 0.2, target = 0.5, bloat = 2.0 }
+"2160" = { floor = 3.5, target = 6.5, bloat = 14.0 }
+"1080" = { floor = 1.0, target = 2.6, bloat = 7.0 }
+"720"  = { floor = 0.4, target = 1.0, bloat = 3.5 }
+"480"  = { floor = 0.2, target = 0.45, bloat = 2.0 }
 
 [optimizer.topsis.presets.Compact]
 # Smallest viable: lowest target that is still a legitimate encode for the resolution.
@@ -154,10 +154,10 @@ resolution = 0.10
 size = 0.70
 pick = "min_size"
 [optimizer.topsis.presets.Compact.reference]
-"2160" = { floor = 4.0, target = 6.0, bloat = 12.0 }
-"1080" = { floor = 1.2, target = 2.5, bloat = 6.0 }
-"720"  = { floor = 0.4, target = 1.0, bloat = 3.0 }
-"480"  = { floor = 0.2, target = 0.4, bloat = 2.0 }
+"2160" = { floor = 3.0, target = 5.0, bloat = 12.0 }
+"1080" = { floor = 1.0, target = 2.0, bloat = 6.0 }
+"720"  = { floor = 0.35, target = 0.8, bloat = 3.0 }
+"480"  = { floor = 0.2, target = 0.35, bloat = 2.0 }
 
 # Per-profile-name overrides. Reference a preset, or override weights / pick / reference / margin:
 # [optimizer.topsis.profiles."2160p Remux"]
