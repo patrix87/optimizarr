@@ -1,17 +1,24 @@
 """Weight lab: visualize how the presets score and pick releases under the new model.
 
-Drives the real engine: the shared size reference + per-preset weights/size_aim/pick, the
-transition gate, and the per-profile pick. For each scenario it shows every candidate's closeness
-under every preset (★ = the preset's gated pick; "drop" = excluded by the shared gb/h floor or
-the score gap-cut) and the ACT/HOLD decision vs the current file (via the real decide()). Part 2
-stresses retention on a large and a small release pool for a size-leaning preset.
+Drives the real engine: each preset's weights + absolute size table {floor, target, bloat} + pick,
+and the closeness-gain swap rule (via the real decide()). Two modes:
+
+  - default (synthetic): curated scenarios + a retention stress test, showing every candidate's
+    closeness under every preset (★ = the preset's pick; "drop" = excluded by that preset's size
+    band or the score gap-cut).
+  - --dataset PATH: drive a real gathered set (tools/gather_training_data.py JSONL). For a random
+    sample of movies it shows, per preset, the decision and the GiB/h it would land on — the best
+    sanity check for tuning the per-preset size tables.
 
 Run:  uv run python tools/weight_lab.py
+      uv run python tools/weight_lab.py --dataset reports/training_data_radarr.jsonl --limit 25
 Writes a timestamped Markdown report under ./reports/ and prints a short summary.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -239,9 +246,117 @@ def render_retention(t: Topsis, name: str, releases: list[dict]) -> list[str]:
     return md
 
 
+# ----- real dataset mode (gather_training_data.py JSONL) -----
+
+
+def _rel_from_record(r: dict) -> dict:
+    return {
+        "title": r.get("title") or "?",
+        "customFormatScore": r.get("score") or 0,
+        "quality": {"quality": {"resolution": r.get("resolution") or 0}},
+        "size": r.get("size_bytes") or 0,
+        "rejections": r.get("rejections") or [],
+        "temporarilyRejected": bool(r.get("temporarily_rejected")),
+    }
+
+
+def _file_from_record(c: dict | None) -> dict | None:
+    if not c:
+        return None
+    return {
+        "id": 1,
+        "customFormatScore": c.get("score"),
+        "size": c.get("size_bytes") or 0,
+        "mediaInfo": {"resolution": f"x{c.get('resolution') or 0}"},
+    }
+
+
+def render_dataset_item(t: Topsis, rec: dict) -> tuple[list[str], list[str]]:
+    prof = rec.get("profile") or {}
+    pname, tres = prof.get("name"), prof.get("target_resolution")
+    rt = rec.get("runtime_h") or 0
+    releases = [_rel_from_record(r) for r in rec.get("releases", [])]
+    cur_file = _file_from_record(rec.get("current_file"))
+    cur = rec.get("current_file") or {}
+    cur_gbh = cur.get("gbh", 0.0) or 0.0
+    title = rec.get("title", "?")
+
+    md = [
+        f"### {title}",
+        "",
+        f"- profile `{pname}` · target {tres}p · runtime {rt:g}h · {len(releases)} releases",
+        f"- current: score={cur.get('score')} · {cur.get('resolution') or '?'}p · "
+        f"{cur_gbh:.2f} GiB/h",
+        "",
+        "| preset | decision | pick | pick score | pick GiB/h | Δsize | Δcloseness |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    summary = [f"  {title} (cur {cur_gbh:.1f} GiB/h)"]
+    for name in t.cfg.presets:
+        d = decide(t, releases, rt, name, tres, cur_file)
+        if d.action == "ACT" and d.pick:
+            p = d.pick
+            pgbh = p.get("gbh", 0.0)
+            c_clo = (d.current or {}).get("closeness")
+            dclo = (
+                f"{p['closeness'] - c_clo:+.3f}"
+                if c_clo is not None and p.get("closeness") is not None
+                else ""
+            )
+            ttl = p.get("title", "?")
+            ttl = ttl[:42] + "..." if len(ttl) > 45 else ttl
+            md.append(
+                f"| {name} | GRAB | {ttl} | {p.get('score') or 0:,} | {pgbh:.2f} | "
+                f"{pgbh - cur_gbh:+.2f} | {dclo} |"
+            )
+            summary.append(f"    {name:<10} GRAB {pgbh:5.1f} GiB/h  {ttl}")
+        else:
+            md.append(f"| {name} | HOLD | — | | | | |")
+            summary.append(f"    {name:<10} HOLD")
+    md.append("")
+    return md, summary
+
+
+def run_dataset(t: Topsis, path: Path, limit: int, seed: int) -> tuple[list[str], list[str]]:
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    random.Random(seed).shuffle(records)
+    sample = records[:limit]
+    md = [
+        f"# Preset lab — real library sample ({len(sample)} of {len(records)} movies)",
+        "",
+        f"Generated {datetime.now().isoformat(timespec='seconds')} · dataset `{path}`",
+        "",
+        "Per movie: each preset's decision and the GiB/h it would land on, via the real decide() "
+        "over all gathered candidates (incl. remux). Lets you eyeball the per-preset size tables "
+        "on real releases.",
+        "",
+    ]
+    summaries: list[str] = []
+    for rec in sample:
+        lines, summary = render_dataset_item(t, rec)
+        md.extend(lines)
+        summaries.extend(summary)
+    return md, summaries
+
+
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dataset", type=Path, help="JSONL from gather_training_data.py")
+    ap.add_argument("--limit", type=int, default=25, help="movies to sample in --dataset mode")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
     t = Topsis(default_topsis())
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if args.dataset:
+        md, summaries = run_dataset(t, args.dataset, args.limit, args.seed)
+        out = Path("reports") / f"weight-lab-dataset-{ts}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(md) + "\n")
+        print(f"wrote {out}")
+        print("\n".join(summaries))
+        return
 
     md: list[str] = [
         "# Preset lab",
