@@ -1,6 +1,8 @@
 import pytest
 
 from optimizarr.config import load_config
+from optimizarr.features.optimizer.config import PICK_ORDERS
+from optimizarr.features.optimizer.worker import _PICK_ORDER_KEYS
 
 _MANAGED_ENV_VARS = [
     "LOG_LEVEL",
@@ -111,6 +113,26 @@ def test_rejects_invalid_pick_order(monkeypatch, tmp_path):
     path = _write(tmp_path, '[optimizer]\npick_order = "sideways"\n')
     with pytest.raises(ValueError, match="pick_order"):
         load_config(path)
+
+
+@pytest.mark.parametrize("order", sorted(PICK_ORDERS))
+def test_accepts_every_pick_order_through_full_load(monkeypatch, tmp_path, order):
+    # Guards the regression that shipped to prod: the validator must accept every order the
+    # worker can actually execute, exercised through the real load_config path (not order_pool
+    # directly, which is what let the mismatch slip past the existing tests).
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    path = _write(tmp_path, f'[optimizer]\npick_order = "{order}"\n')
+    cfg = load_config(path)
+    assert cfg.optimizer.pick_order == order
+
+
+def test_pick_orders_match_worker_keys():
+    # The validator set and the worker's sort-key table must stay in lockstep: "random" is the
+    # only order handled outside the key table. If they drift, a config either rejects an order
+    # the worker supports (prod error) or accepts one that KeyErrors at runtime.
+    expected = {"random", *_PICK_ORDER_KEYS}
+    assert expected == PICK_ORDERS
 
 
 def test_rejects_process_interval_below_floor(monkeypatch, tmp_path):

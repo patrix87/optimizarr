@@ -23,7 +23,17 @@ from dataclasses import dataclass, field
 
 from optimizarr.config import RADARR_RELEASE_TYPES, SONARR_RELEASE_TYPES
 
-PICK_ORDERS = {"random", "ordered"}
+PICK_ORDERS = {
+    "random",  # shuffle each pass
+    "alphabetical_asc",  # A->Z by title
+    "alphabetical_desc",  # Z->A by title
+    "size_asc",  # smallest file first
+    "size_desc",  # biggest file first
+    "date_added_asc",  # oldest import first
+    "date_added_desc",  # newest import first
+    "release_date_asc",  # oldest release first
+    "release_date_desc",  # newest release first
+}
 PICK_METHODS = {"topsis", "max_score", "min_size"}
 
 # resolution -> (floor, target, bloat) GiB/h.
