@@ -1,17 +1,24 @@
 """Weight lab: visualize how the presets score and pick releases under the new model.
 
-Drives the real engine: the shared size reference + per-preset weights/size_aim/pick, the
-transition gate, and the per-profile pick. For each scenario it shows every candidate's closeness
-under every preset (★ = the preset's gated pick; "drop" = excluded by the shared gb/h floor or
-the score gap-cut) and the ACT/HOLD decision vs the current file (via the real decide()). Part 2
-stresses retention on a large and a small release pool for a size-leaning preset.
+Drives the real engine: each preset's weights + absolute size table {floor, target, bloat} + pick,
+and the closeness-gain swap rule (via the real decide()). Two modes:
+
+  - default (synthetic): curated scenarios + a retention stress test, showing every candidate's
+    closeness under every preset (★ = the preset's pick; "drop" = excluded by that preset's size
+    band or the score gap-cut).
+  - --dataset PATH: drive a real gathered set (tools/gather_training_data.py JSONL). For a random
+    sample of movies it shows, per preset, the decision and the GiB/h it would land on — the best
+    sanity check for tuning the per-preset size tables.
 
 Run:  uv run python tools/weight_lab.py
+      uv run python tools/weight_lab.py --dataset reports/training_data_radarr.jsonl --limit 25
 Writes a timestamped Markdown report under ./reports/ and prints a short summary.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -90,11 +97,11 @@ def _resolved(t: Topsis, name: str) -> ResolvedProfile:
     return t.resolve_profile(name)
 
 
-def _included(t: Topsis, releases: list[dict], runtime_h: float) -> set[int]:
-    """ids of releases that survive the shared gb/h floor + the score gap-cut (preset-agnostic
-    now — the floor is shared)."""
-    after_gbh = t.filter_by_gbh_floor(eligible(releases), runtime_h)
-    return {id(r) for r in t.filter_by_score_gap(after_gbh)}
+def _included(t: Topsis, releases: list[dict], runtime_h: float, rp: ResolvedProfile) -> set[int]:
+    """ids of releases that survive this preset's size band (floor..bloat) + the score gap-cut.
+    Inclusion is now per-preset, since each preset carries its own size table."""
+    after_band = t.filter_by_size_band(eligible(releases), runtime_h, rp.reference)
+    return {id(r) for r in t.filter_by_score_gap(after_band)}
 
 
 def _closeness(
@@ -106,7 +113,7 @@ def _closeness(
 def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
     presets = t.cfg.presets
     rp = {name: _resolved(t, name) for name in presets}
-    included = _included(t, sc.candidates, sc.runtime_h)
+    included = {name: _included(t, sc.candidates, sc.runtime_h, rp[name]) for name in presets}
     cur_clo = {
         name: _closeness(t, rp[name], sc.current, sc.runtime_h, sc.target_res) for name in presets
     }
@@ -136,12 +143,12 @@ def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
     md.append("| " + " | ".join(header) + " |")
     md.append("|" + "|".join(["---"] * len(header)) + "|")
 
-    def row(r: dict, clo: dict[str, float], dropped: bool) -> str:
+    def row(r: dict, clo: dict[str, float], dropped: dict[str, bool] | None) -> str:
         gbh = (r["size"] / GB) / sc.runtime_h
         res = r["quality"]["quality"]["resolution"]
         cells = [r["title"], f"{r['customFormatScore']:,}", f"{res}p", f"{gbh:.1f}"]
         for name in presets:
-            if dropped:
+            if dropped and dropped[name]:
                 cells.append("drop")
             else:
                 val = f"{clo[name]:.3f}"
@@ -150,9 +157,9 @@ def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
                 cells.append(val)
         return "| " + " | ".join(cells) + " |"
 
-    md.append(row(sc.current, cur_clo, False) + "  ← current")
+    md.append(row(sc.current, cur_clo, None) + "  ← current")
     for r in sc.candidates:
-        md.append(row(r, cand_clo[id(r)], id(r) not in included))
+        md.append(row(r, cand_clo[id(r)], {name: id(r) not in included[name] for name in presets}))
     md.append("")
 
     md.append("**Decision per preset** (real gate + pick vs current):")
@@ -201,14 +208,14 @@ def render_retention(t: Topsis, name: str, releases: list[dict]) -> list[str]:
     rp = _resolved(t, RETENTION_PRESET)
     rt = RETENTION_RUNTIME_H
     after_hard = eligible(releases)
-    after_gbh = t.filter_by_gbh_floor(after_hard, rt)
-    kept = t.filter_by_score_gap(after_gbh)
+    after_band = t.filter_by_size_band(after_hard, rt, rp.reference)
+    kept = t.filter_by_score_gap(after_band)
 
     md = [f"### {name}  (preset {RETENTION_PRESET})", ""]
     md.append("| stage | releases |")
     md.append("|---|---|")
     md.append(f"| input | {len(releases)} |")
-    md.append(f"| after gb/h floor (fakes out) | {len(after_gbh)} |")
+    md.append(f"| after size band (floor..bloat) | {len(after_band)} |")
     md.append(f"| after score gap-cut | {len(kept)} |")
     md.append("")
 
@@ -239,39 +246,144 @@ def render_retention(t: Topsis, name: str, releases: list[dict]) -> list[str]:
     return md
 
 
+# ----- real dataset mode (gather_training_data.py JSONL) -----
+
+
+def _rel_from_record(r: dict) -> dict:
+    return {
+        "title": r.get("title") or "?",
+        "customFormatScore": r.get("score") or 0,
+        "quality": {"quality": {"resolution": r.get("resolution") or 0}},
+        "size": r.get("size_bytes") or 0,
+        "rejections": r.get("rejections") or [],
+        "temporarilyRejected": bool(r.get("temporarily_rejected")),
+    }
+
+
+def _file_from_record(c: dict | None) -> dict | None:
+    if not c:
+        return None
+    return {
+        "id": 1,
+        "customFormatScore": c.get("score"),
+        "size": c.get("size_bytes") or 0,
+        "mediaInfo": {"resolution": f"x{c.get('resolution') or 0}"},
+    }
+
+
+def render_dataset_item(t: Topsis, rec: dict) -> tuple[list[str], list[str]]:
+    prof = rec.get("profile") or {}
+    pname, tres = prof.get("name"), prof.get("target_resolution")
+    rt = rec.get("runtime_h") or 0
+    releases = [_rel_from_record(r) for r in rec.get("releases", [])]
+    cur_file = _file_from_record(rec.get("current_file"))
+    cur = rec.get("current_file") or {}
+    cur_gbh = cur.get("gbh", 0.0) or 0.0
+    title = rec.get("title", "?")
+
+    md = [
+        f"### {title}",
+        "",
+        f"- profile `{pname}` · target {tres}p · runtime {rt:g}h · {len(releases)} releases",
+        f"- current: score={cur.get('score')} · {cur.get('resolution') or '?'}p · "
+        f"{cur_gbh:.2f} GiB/h",
+        "",
+        "| preset | decision | pick | pick score | pick GiB/h | Δsize | Δcloseness |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    summary = [f"  {title} (cur {cur_gbh:.1f} GiB/h)"]
+    for name in t.cfg.presets:
+        d = decide(t, releases, rt, name, tres, cur_file)
+        if d.action == "ACT" and d.pick:
+            p = d.pick
+            pgbh = p.get("gbh", 0.0)
+            c_clo = (d.current or {}).get("closeness")
+            dclo = (
+                f"{p['closeness'] - c_clo:+.3f}"
+                if c_clo is not None and p.get("closeness") is not None
+                else ""
+            )
+            ttl = p.get("title", "?")
+            ttl = ttl[:42] + "..." if len(ttl) > 45 else ttl
+            md.append(
+                f"| {name} | GRAB | {ttl} | {p.get('score') or 0:,} | {pgbh:.2f} | "
+                f"{pgbh - cur_gbh:+.2f} | {dclo} |"
+            )
+            summary.append(f"    {name:<10} GRAB {pgbh:5.1f} GiB/h  {ttl}")
+        else:
+            md.append(f"| {name} | HOLD | — | | | | |")
+            summary.append(f"    {name:<10} HOLD")
+    md.append("")
+    return md, summary
+
+
+def run_dataset(t: Topsis, path: Path, limit: int, seed: int) -> tuple[list[str], list[str]]:
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    random.Random(seed).shuffle(records)
+    sample = records[:limit]
+    md = [
+        f"# Preset lab — real library sample ({len(sample)} of {len(records)} movies)",
+        "",
+        f"Generated {datetime.now().isoformat(timespec='seconds')} · dataset `{path}`",
+        "",
+        "Per movie: each preset's decision and the GiB/h it would land on, via the real decide() "
+        "over all gathered candidates (incl. remux). Lets you eyeball the per-preset size tables "
+        "on real releases.",
+        "",
+    ]
+    summaries: list[str] = []
+    for rec in sample:
+        lines, summary = render_dataset_item(t, rec)
+        md.extend(lines)
+        summaries.extend(summary)
+    return md, summaries
+
+
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dataset", type=Path, help="JSONL from gather_training_data.py")
+    ap.add_argument("--limit", type=int, default=25, help="movies to sample in --dataset mode")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
     t = Topsis(default_topsis())
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if args.dataset:
+        md, summaries = run_dataset(t, args.dataset, args.limit, args.seed)
+        out = Path("reports") / f"weight-lab-dataset-{ts}.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(md) + "\n")
+        print(f"wrote {out}")
+        print("\n".join(summaries))
+        return
 
     md: list[str] = [
         "# Preset lab",
         "",
         f"Generated {datetime.now().isoformat(timespec='seconds')}",
         "",
-        "One shared size reference {floor, target, ceiling} GiB/h; each preset adds weights, a",
-        "relative size_aim (one-sided curve plateau), a pick method, and transition rules. ★ = the",
-        "preset's gated pick; 'drop' = excluded by the shared gb/h floor or the score gap-cut.",
-        "",
-        "## Shared size reference (GiB/h)",
-        "",
-        "| res | floor | target | ceiling |",
-        "|---|---|---|---|",
-    ]
-    for res in sorted(t.cfg.reference, reverse=True):
-        floor, target, ceiling = t.cfg.reference[res]
-        md.append(f"| {res}p | {floor:g} | {target:g} | {ceiling:g} |")
-    md += [
+        "Each preset carries its own absolute size table {floor, target, bloat} GiB/h, weights,",
+        "and a pick method. A candidate is grabbed only if it raises closeness by at least",
+        "min_closeness_gain (and does not drop resolution below target). ★ = the preset's pick;",
+        "'drop' = excluded by that preset's size band (floor..bloat) or the score gap-cut.",
         "",
         "## Presets",
         "",
-        "| preset | score | res | size | size_aim | pick |",
-        "|---|---|---|---|---|---|",
+        "| preset | score | res | size | pick | gain | 2160 (floor/target/bloat) | 1080 | 720 |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
+
+    def _band(p, res: int) -> str:
+        f, tgt, b = p.reference.get(res, ("-", "-", "-"))
+        return f"{f:g}/{tgt:g}/{b:g}" if f != "-" else "-"
+
     for name, p in t.cfg.presets.items():
         w = p.weights
         md.append(
             f"| {name} | {w['score']:.2f} | {w['resolution']:.2f} | {w['size']:.2f} | "
-            f"{p.size_aim:g} | {p.pick} |"
+            f"{p.pick} | {p.min_closeness_gain:g} | {_band(p, 2160)} | {_band(p, 1080)} | "
+            f"{_band(p, 720)} |"
         )
     md.append("")
     md.append("# Part 1 — preset comparison on curated scenarios")

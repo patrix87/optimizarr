@@ -91,6 +91,20 @@ class ArrApi:
     def current_file_id(self, item: dict) -> int | None:
         return (self._embedded_file(item) or {}).get("id")
 
+    # Ordering keys for the optimizer's pick_order. file_size / date_added read the embedded
+    # file (always present in the listing, since the pool is gated on hasFile); release_date is
+    # app-specific (Radarr movies vs. Sonarr episodes carry different date fields). All three
+    # are cheap reads off the already-fetched item (no extra HTTP). Missing values fall back to
+    # 0 / "" so they sort first ascending (last descending).
+    def file_size(self, item: dict) -> int:
+        return (self._embedded_file(item) or {}).get("size") or 0
+
+    def date_added(self, item: dict) -> str:
+        return (self._embedded_file(item) or {}).get("dateAdded") or ""
+
+    def release_date(self, item: dict) -> str:
+        raise NotImplementedError
+
     # ----- actions (concrete) -----
 
     def grab(self, release: dict) -> None:
