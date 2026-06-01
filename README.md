@@ -29,18 +29,19 @@ It does two jobs, both optional and independent:
   good-but-smaller encodes, without ever making a file *bigger* unless it is a real upgrade.
 - **Pick like a human, per profile.** Five shipped profiles (**Remux, Quality, Balanced,
   Efficient, Compact**) each have their own taste, from "max quality, size be damned" to
-  "smallest file that is still good." A multi-objective ranking (TOPSIS) plus a hard rule set
-  chooses among the releases your indexers actually offer.
+  "smallest file that is still good." A multi-objective ranking (TOPSIS) plus hard size and
+  resolution gates chooses among the releases your indexers actually offer.
 - **Stop the endless upgrade chase.** The **Unmonitor** job unmonitors movies/episodes a set
   number of days after release, so Radarr/Sonarr stop grabbing "new" releases off RSS just
   because they appeared.
 
 It is safe by design: it **never inflates a file** to hit a target, it **cannot oscillate**
-between two releases, and "optimized" means *the algorithm can no longer find anything better*,
-never merely "we triggered a grab" (grabs fail to download all the time, and it handles that).
+(every swap strictly raises a single quality score, so a file is never revisited), and
+"optimized" means *the algorithm can no longer find anything better*, never merely "we triggered a
+grab" (grabs fail to download all the time, and it handles that).
 
-> Want the details: the decision matrix, the guard rails, the TOPSIS formulas, the config model,
-> and the worker loop? See **[ALGORITHM.md](ALGORITHM.md)**.
+> Want the details: the per-preset size tables, the swap rule, the TOPSIS formulas, the config
+> model, and the worker loop? See **[ALGORITHM.md](ALGORITHM.md)**.
 
 ## Transparency
 
@@ -121,7 +122,7 @@ The defaults are sensible; most setups only adjust a handful of keys (all docume
 | `[optimizer.<app>] allow_size_increase` | `false` blocks any bigger file (also blocks resolution upgrades). |
 | `[optimizer.<app>] allow_quality_downgrade` | `false` blocks lower-score releases. **Turn this off if you only ever want upgrades.** Leaving it on is what lets Efficient/Compact realign downward. |
 | `[unmonitor.<app>] days` / `release_type` / `require_cutoff_met` | When to unmonitor after release, and whether to wait for the quality cutoff first. |
-| `[optimizer.topsis]` | The selection engine: the shared size **reference**, per-profile **presets**, and tuning. You rarely need this. See [ALGORITHM.md](ALGORITHM.md). |
+| `[optimizer.topsis]` | The selection engine: per-preset size **tables** (floor/target/bloat), **presets**, and tuning. You rarely need this. See [ALGORITHM.md](ALGORITHM.md). |
 
 The optimizer selects items by **`hasFile`**, regardless of monitored state. It improves the
 existing library, and the unmonitor job deliberately strips monitoring once a file exists.
