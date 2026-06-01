@@ -1,14 +1,20 @@
 """Optimizer feature configuration: schema + parsing of the [optimizer] TOML section.
 
-Tuning values (the shared size reference, presets, transition rules, score anchors) come from
-the merged config (defaults.toml + the user's config.toml) — there are no magic defaults baked
-into this module. The shared loader (optimizarr.config) delegates to parse_optimizer() here.
+Tuning values (per-preset size tables, score anchors) come from the merged config
+(defaults.toml + the user's config.toml) — there are no magic defaults baked into this module.
+The shared loader (optimizarr.config) delegates to parse_optimizer() here.
 
-Size model: one objective `[reference]` per resolution gives `{floor, target, ceiling}` GiB/h,
-shared by every profile. Each preset only carries a *relative* `size_aim` (fraction of target,
-where its one-sided size curve plateaus) plus its TOPSIS weights, a `pick` method, and a
-`transitions` rule set (which moves from the current file are legal). See
-docs/condition-matrix-design.md.
+Size model: each preset carries its OWN absolute `reference` table, one `{floor, target, bloat}`
+entry per resolution, in GiB/h:
+  - floor : below this the encode is illegitimate for the resolution (upscale / mislabeled /
+            too soft) -> hard pre-filter drop.
+  - target: where the TOPSIS size score plateaus (n_size = 1.0 at/below target).
+  - bloat : above this is bloat -> hard pre-filter drop (and n_size = 0 at bloat).
+
+The swap rule is a single closeness-gain test (see decision.py): a candidate is taken only if it
+raises TOPSIS closeness by at least `min_closeness_gain`, plus a resolution guard. That makes the
+optimizer provably non-oscillating (closeness is file-independent and strictly increases), so the
+old relative size/score "much/slightly" transition matrix is gone.
 """
 
 from __future__ import annotations
@@ -17,66 +23,42 @@ from dataclasses import dataclass, field
 
 from optimizarr.config import RADARR_RELEASE_TYPES, SONARR_RELEASE_TYPES
 
-PICK_ORDERS = {
-    "random",  # shuffle each pass
-    "alphabetical_asc",  # A->Z by title
-    "alphabetical_desc",  # Z->A by title
-    "size_asc",  # smallest file first
-    "size_desc",  # biggest file first
-    "date_added_asc",  # oldest import first
-    "date_added_desc",  # newest import first
-    "release_date_asc",  # oldest release first
-    "release_date_desc",  # newest release first
-}
+PICK_ORDERS = {"random", "ordered"}
 PICK_METHODS = {"topsis", "max_score", "min_size"}
 
-
-@dataclass
-class Transitions:
-    """Per-profile rule set deciding which moves from the current file are legal. Magnitudes are
-    on normalized/relative scales (see classify() in transitions.py). The universal forbidden
-    moves are hard-coded; these flags express the per-profile differences."""
-
-    score_slack: float  # |Δn_score| within this = "same" (noise band)
-    score_much: float  # |Δn_score| beyond this = "much" higher/lower (MUST exceed score_slack)
-    size_slack: float  # |relative size delta| within this = "same"
-    size_much: float  # relative size delta beyond this = "much" smaller/bigger
-    allow_bigger_for_score: bool  # may a bigger file be accepted for a higher score?
-    bigger_needs_much_score: bool  # if so, must the gain clear score_much (vs any higher)?
-    accept_score_drop: bool  # may a slightly-lower-score release be accepted at all?
-    slight_drop_needs_much_smaller: bool  # if so, only when it is *much* smaller?
-    accept_much_lower_score: bool  # may a much-lower-score release be accepted (Compact)?
-    viability_score: int  # floor below which score drops are never accepted
+# resolution -> (floor, target, bloat) GiB/h.
+Reference = dict[int, tuple[float, float, float]]
 
 
 @dataclass
 class Preset:
-    """A named bundle: TOPSIS weights + a relative size aim + a pick method + transition rules."""
+    """A named bundle: TOPSIS weights + a pick method + an absolute size table + swap margin."""
 
     weights: dict[str, float]  # keys: score, resolution, size (sum 1.0)
-    size_aim: float  # fraction of reference target where n_size stops being 1.0 (one-sided)
     pick: str  # "topsis" | "max_score" | "min_size"
-    transitions: Transitions
+    reference: Reference  # res -> (floor, target, bloat) GiB/h
+    min_closeness_gain: float  # swap only if closeness improves by at least this
 
 
 @dataclass
 class ProfileOverride:
-    """Exact-name override: reference a preset, or override its weights / size_aim / pick."""
+    """Exact-name override: reference a preset, or override its weights / pick / table / margin."""
 
     preset: str | None = None
     weights: dict[str, float] | None = None
-    size_aim: float | None = None
     pick: str | None = None
+    reference: Reference | None = None
+    min_closeness_gain: float | None = None
 
 
 @dataclass
 class ResolvedProfile:
-    """Everything the picker needs for one profile, after preset + override resolution."""
+    """Everything the scorer + swap rule need for one profile, after preset + override."""
 
     weights: dict[str, float]
-    size_aim: float
     pick: str
-    transitions: Transitions
+    reference: Reference
+    min_closeness_gain: float
 
 
 @dataclass
@@ -87,8 +69,7 @@ class TopsisConfig:
     resolution_anti_ideal: int
     score_gap: float
     default_preset: str
-    # resolution -> (floor, target, ceiling) GiB/h, shared by all profiles.
-    reference: dict[int, tuple[float, float, float]]
+    default_min_closeness_gain: float
     presets: dict[str, Preset]
     profiles: dict[str, ProfileOverride] = field(default_factory=dict)
 
@@ -97,24 +78,16 @@ class TopsisConfig:
 class OptimizerAppConfig:
     enabled: bool = True
     min_age_days: int = 0
-    # List of date fields the age gate checks. ALL listed dates must be at least
-    # min_age_days old. Two-gate default ([release, dateAdded]) avoids touching freshly
-    # released items (still being chased by Radarr/Sonarr) and freshly imported files.
     release_type: list[str] = field(default_factory=list)
     # If False, releases bigger than the current file are filtered out before scoring —
     # blocks resolution upgrades too (1080p -> 2160p is always a size increase).
     allow_size_increase: bool = True
     # If False, releases with a lower score than the current file are filtered out before
-    # scoring. NOTE: turning this off neutralizes size-leaning presets (Compact/Efficient),
-    # which are designed to swap a slightly-lower-score release for a meaningfully smaller one.
+    # scoring. NOTE: turning this off neutralizes size-leaning presets (Compact/Efficient).
     allow_quality_downgrade: bool = True
-    # If True, queue items waiting for manual import don't count toward queue_max — only
-    # actively downloading/queued items do. Keeps the optimizer flowing when downgrades or
-    # other rejected items pile up in the import-pending state.
+    # If True, queue items waiting for manual import don't count toward queue_max.
     ignore_completed_in_queue: bool = True
-    # If True, on each tick the worker scans the queue for completed items rejected solely
-    # for score regression ("Not an upgrade") and force-imports them through manualimport.
-    # Other rejection categories (executable/sample/mismatch) are left untouched.
+    # If True, the worker force-imports completed items rejected solely for score regression.
     auto_import_downgrades: bool = True
 
 
@@ -122,10 +95,6 @@ class OptimizerAppConfig:
 class OptimizerConfig:
     enabled: bool = False
     queue_max: int = 5
-    # When more than this many completed downloads are waiting to import (trackedDownloadState
-    # importPending) or actively importing (importing), pause grabbing new releases so the
-    # import backlog drains first. importBlocked is excluded: it needs manual action and would
-    # never clear, freezing grabs forever.
     import_max: int = 2
     pick_order: str = "random"
     process_interval_seconds: int = 15
@@ -150,59 +119,27 @@ def _weights(raw: dict, where: str) -> dict[str, float]:
     return w
 
 
-def _reference(raw: dict, where: str) -> dict[int, tuple[float, float, float]]:
-    out: dict[int, tuple[float, float, float]] = {}
+def _reference(raw: dict, where: str) -> Reference:
+    out: Reference = {}
     for res, entry in raw.items():
         try:
             res_int = int(res)
         except (TypeError, ValueError) as e:
             raise ValueError(f"{where}: key {res!r} is not an integer resolution") from e
-        if not isinstance(entry, dict) or not {"floor", "target", "ceiling"} <= entry.keys():
-            raise ValueError(f"{where}.{res}: expected {{floor, target, ceiling}}, got {entry!r}")
+        if not isinstance(entry, dict) or not {"floor", "target", "bloat"} <= entry.keys():
+            raise ValueError(f"{where}.{res}: expected {{floor, target, bloat}}, got {entry!r}")
         floor = float(entry["floor"])
         target = float(entry["target"])
-        ceiling = float(entry["ceiling"])
-        if not (floor < target <= ceiling):
+        bloat = float(entry["bloat"])
+        if not (floor < target <= bloat):
             raise ValueError(
-                f"{where}.{res}: must satisfy floor < target <= ceiling, "
-                f"got floor={floor} target={target} ceiling={ceiling}"
+                f"{where}.{res}: must satisfy floor < target <= bloat, "
+                f"got floor={floor} target={target} bloat={bloat}"
             )
-        out[res_int] = (floor, target, ceiling)
+        out[res_int] = (floor, target, bloat)
     if not out:
-        raise ValueError(f"{where} is empty (defaults.toml should define it)")
+        raise ValueError(f"{where} is empty (a preset must define its size table)")
     return out
-
-
-def _transitions(raw: dict, where: str) -> Transitions:
-    def num(key: str, default: float) -> float:
-        return float(raw.get(key, default))
-
-    def flag(key: str, default: bool) -> bool:
-        return bool(raw.get(key, default))
-
-    score_slack = num("score_slack", 0.02)
-    score_much = num("score_much", 0.10)
-    size_slack = num("size_slack", 0.03)
-    size_much = num("size_much", 0.30)
-    if score_much <= score_slack:
-        raise ValueError(
-            f"{where}: score_much ({score_much}) must exceed score_slack ({score_slack}) — "
-            f"this inequality is what guarantees no two-file oscillation"
-        )
-    if size_much <= size_slack:
-        raise ValueError(f"{where}: size_much ({size_much}) must exceed size_slack ({size_slack})")
-    return Transitions(
-        score_slack=score_slack,
-        score_much=score_much,
-        size_slack=size_slack,
-        size_much=size_much,
-        allow_bigger_for_score=flag("allow_bigger_for_score", True),
-        bigger_needs_much_score=flag("bigger_needs_much_score", True),
-        accept_score_drop=flag("accept_score_drop", True),
-        slight_drop_needs_much_smaller=flag("slight_drop_needs_much_smaller", False),
-        accept_much_lower_score=flag("accept_much_lower_score", False),
-        viability_score=int(raw.get("viability_score", 0)),
-    )
 
 
 def _parse_pick(raw: dict, where: str) -> str:
@@ -212,32 +149,50 @@ def _parse_pick(raw: dict, where: str) -> str:
     return pick
 
 
-def _parse_size_aim(value: float | int | str, where: str) -> float:
-    aim = float(value)
-    if not (0.0 < aim <= 1.0):
-        raise ValueError(f"{where}.size_aim must satisfy 0 < size_aim <= 1.0, got {aim}")
-    return aim
+def _parse_min_gain(value: float | int, where: str) -> float:
+    gain = float(value)
+    if not (0.0 <= gain < 1.0):
+        raise ValueError(f"{where}.min_closeness_gain must satisfy 0 <= gain < 1.0, got {gain}")
+    return gain
 
 
-def _parse_preset(raw: dict, where: str) -> Preset:
+def _parse_preset(raw: dict, where: str, default_min_gain: float) -> Preset:
+    if "reference" not in raw:
+        raise ValueError(f"{where}: missing required size table [{where}.reference]")
+    min_gain = (
+        _parse_min_gain(raw["min_closeness_gain"], where)
+        if "min_closeness_gain" in raw
+        else default_min_gain
+    )
     return Preset(
         weights=_weights(raw, where),
-        size_aim=_parse_size_aim(raw.get("size_aim", 1.0), where),
         pick=_parse_pick(raw, where),
-        transitions=_transitions(raw.get("transitions", {}), f"{where}.transitions"),
+        reference=_reference(raw["reference"], f"{where}.reference"),
+        min_closeness_gain=min_gain,
     )
 
 
 def _parse_profile_override(raw: dict, where: str) -> ProfileOverride:
     weights = _weights(raw["weights"], f"{where}.weights") if "weights" in raw else None
-    size_aim = _parse_size_aim(raw["size_aim"], where) if "size_aim" in raw else None
     pick = _parse_pick(raw, where) if "pick" in raw else None
-    return ProfileOverride(preset=raw.get("preset"), weights=weights, size_aim=size_aim, pick=pick)
+    reference = _reference(raw["reference"], f"{where}.reference") if "reference" in raw else None
+    min_gain = (
+        _parse_min_gain(raw["min_closeness_gain"], where) if "min_closeness_gain" in raw else None
+    )
+    return ProfileOverride(
+        preset=raw.get("preset"),
+        weights=weights,
+        pick=pick,
+        reference=reference,
+        min_closeness_gain=min_gain,
+    )
 
 
 def _parse_topsis(raw: dict) -> TopsisConfig:
+    default_min_gain = _parse_min_gain(raw.get("min_closeness_gain", 0.02), "optimizer.topsis")
     presets = {
-        name: _parse_preset(p, f"presets.{name}") for name, p in raw.get("presets", {}).items()
+        name: _parse_preset(p, f"presets.{name}", default_min_gain)
+        for name, p in raw.get("presets", {}).items()
     }
     if not presets:
         raise ValueError("optimizer.topsis.presets is empty (defaults.toml should define them)")
@@ -258,7 +213,7 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
         resolution_anti_ideal=int(raw["resolution_anti_ideal"]),
         score_gap=float(raw["score_gap"]),
         default_preset=default_preset,
-        reference=_reference(raw.get("reference", {}), "optimizer.topsis.reference"),
+        default_min_closeness_gain=default_min_gain,
         presets=presets,
         profiles=profiles,
     )

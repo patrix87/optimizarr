@@ -90,11 +90,11 @@ def _resolved(t: Topsis, name: str) -> ResolvedProfile:
     return t.resolve_profile(name)
 
 
-def _included(t: Topsis, releases: list[dict], runtime_h: float) -> set[int]:
-    """ids of releases that survive the shared gb/h floor + the score gap-cut (preset-agnostic
-    now — the floor is shared)."""
-    after_gbh = t.filter_by_gbh_floor(eligible(releases), runtime_h)
-    return {id(r) for r in t.filter_by_score_gap(after_gbh)}
+def _included(t: Topsis, releases: list[dict], runtime_h: float, rp: ResolvedProfile) -> set[int]:
+    """ids of releases that survive this preset's size band (floor..bloat) + the score gap-cut.
+    Inclusion is now per-preset, since each preset carries its own size table."""
+    after_band = t.filter_by_size_band(eligible(releases), runtime_h, rp.reference)
+    return {id(r) for r in t.filter_by_score_gap(after_band)}
 
 
 def _closeness(
@@ -106,7 +106,7 @@ def _closeness(
 def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
     presets = t.cfg.presets
     rp = {name: _resolved(t, name) for name in presets}
-    included = _included(t, sc.candidates, sc.runtime_h)
+    included = {name: _included(t, sc.candidates, sc.runtime_h, rp[name]) for name in presets}
     cur_clo = {
         name: _closeness(t, rp[name], sc.current, sc.runtime_h, sc.target_res) for name in presets
     }
@@ -136,12 +136,12 @@ def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
     md.append("| " + " | ".join(header) + " |")
     md.append("|" + "|".join(["---"] * len(header)) + "|")
 
-    def row(r: dict, clo: dict[str, float], dropped: bool) -> str:
+    def row(r: dict, clo: dict[str, float], dropped: dict[str, bool] | None) -> str:
         gbh = (r["size"] / GB) / sc.runtime_h
         res = r["quality"]["quality"]["resolution"]
         cells = [r["title"], f"{r['customFormatScore']:,}", f"{res}p", f"{gbh:.1f}"]
         for name in presets:
-            if dropped:
+            if dropped and dropped[name]:
                 cells.append("drop")
             else:
                 val = f"{clo[name]:.3f}"
@@ -150,9 +150,9 @@ def render_scenario(t: Topsis, sc: Scenario) -> tuple[list[str], list[str]]:
                 cells.append(val)
         return "| " + " | ".join(cells) + " |"
 
-    md.append(row(sc.current, cur_clo, False) + "  ← current")
+    md.append(row(sc.current, cur_clo, None) + "  ← current")
     for r in sc.candidates:
-        md.append(row(r, cand_clo[id(r)], id(r) not in included))
+        md.append(row(r, cand_clo[id(r)], {name: id(r) not in included[name] for name in presets}))
     md.append("")
 
     md.append("**Decision per preset** (real gate + pick vs current):")
@@ -201,14 +201,14 @@ def render_retention(t: Topsis, name: str, releases: list[dict]) -> list[str]:
     rp = _resolved(t, RETENTION_PRESET)
     rt = RETENTION_RUNTIME_H
     after_hard = eligible(releases)
-    after_gbh = t.filter_by_gbh_floor(after_hard, rt)
-    kept = t.filter_by_score_gap(after_gbh)
+    after_band = t.filter_by_size_band(after_hard, rt, rp.reference)
+    kept = t.filter_by_score_gap(after_band)
 
     md = [f"### {name}  (preset {RETENTION_PRESET})", ""]
     md.append("| stage | releases |")
     md.append("|---|---|")
     md.append(f"| input | {len(releases)} |")
-    md.append(f"| after gb/h floor (fakes out) | {len(after_gbh)} |")
+    md.append(f"| after size band (floor..bloat) | {len(after_band)} |")
     md.append(f"| after score gap-cut | {len(kept)} |")
     md.append("")
 
@@ -248,30 +248,27 @@ def main() -> None:
         "",
         f"Generated {datetime.now().isoformat(timespec='seconds')}",
         "",
-        "One shared size reference {floor, target, ceiling} GiB/h; each preset adds weights, a",
-        "relative size_aim (one-sided curve plateau), a pick method, and transition rules. ★ = the",
-        "preset's gated pick; 'drop' = excluded by the shared gb/h floor or the score gap-cut.",
-        "",
-        "## Shared size reference (GiB/h)",
-        "",
-        "| res | floor | target | ceiling |",
-        "|---|---|---|---|",
-    ]
-    for res in sorted(t.cfg.reference, reverse=True):
-        floor, target, ceiling = t.cfg.reference[res]
-        md.append(f"| {res}p | {floor:g} | {target:g} | {ceiling:g} |")
-    md += [
+        "Each preset carries its own absolute size table {floor, target, bloat} GiB/h, weights,",
+        "and a pick method. A candidate is grabbed only if it raises closeness by at least",
+        "min_closeness_gain (and does not drop resolution below target). ★ = the preset's pick;",
+        "'drop' = excluded by that preset's size band (floor..bloat) or the score gap-cut.",
         "",
         "## Presets",
         "",
-        "| preset | score | res | size | size_aim | pick |",
-        "|---|---|---|---|---|---|",
+        "| preset | score | res | size | pick | gain | 2160 (floor/target/bloat) | 1080 | 720 |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
+
+    def _band(p, res: int) -> str:
+        f, tgt, b = p.reference.get(res, ("-", "-", "-"))
+        return f"{f:g}/{tgt:g}/{b:g}" if f != "-" else "-"
+
     for name, p in t.cfg.presets.items():
         w = p.weights
         md.append(
             f"| {name} | {w['score']:.2f} | {w['resolution']:.2f} | {w['size']:.2f} | "
-            f"{p.size_aim:g} | {p.pick} |"
+            f"{p.pick} | {p.min_closeness_gain:g} | {_band(p, 2160)} | {_band(p, 1080)} | "
+            f"{_band(p, 720)} |"
         )
     md.append("")
     md.append("# Part 1 — preset comparison on curated scenarios")

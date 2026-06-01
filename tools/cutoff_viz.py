@@ -58,12 +58,8 @@ from pathlib import Path
 from optimizarr.arr import ArrApi, build_client
 from optimizarr.config import load_config
 from optimizarr.features.optimizer.config import OptimizerAppConfig
-from optimizarr.features.optimizer.topsis import (
-    Topsis,
-    _release_resolution,
-    eligible,
-)
-from optimizarr.features.optimizer.transitions import classify, is_forbidden
+from optimizarr.features.optimizer.decision import resolution_ok, swap_allowed
+from optimizarr.features.optimizer.topsis import Topsis, eligible
 
 # Statuses, best-to-worst for display ordering of the legend only.
 KEPT = "candidate"
@@ -111,30 +107,29 @@ def analyze(
         or (r.get("customFormatScore") or 0) >= cur_score
     ]
     after_hard = eligible(after_qual)
-    after_gbh = topsis.filter_by_gbh_floor(after_hard, runtime_h)
-    after_gap = topsis.filter_by_score_gap(after_gbh)  # the gap-cut survivors == "scored"
+    after_band = topsis.filter_by_size_band(after_hard, runtime_h, resolved.reference)
+    after_gap = topsis.filter_by_score_gap(after_band)  # the gap-cut survivors == "scored"
 
     ids = lambda lst: {id(r) for r in lst}  # noqa: E731
     id_size, id_qual = ids(after_size), ids(after_qual)
-    id_hard, id_gbh, id_gap = ids(after_hard), ids(after_gbh), ids(after_gap)
+    id_hard, id_band, id_gap = ids(after_hard), ids(after_band), ids(after_gap)
 
     # The score-gap cutoff line: the lowest score that survived the gap-cut (everything strictly
-    # below it, among gbh/hard survivors, was dropped as the score tail).
+    # below it, among band/hard survivors, was dropped as the score tail).
     gap_cutoff_score = (
         min((r.get("customFormatScore") or 0) for r in after_gap) if after_gap else None
     )
 
-    cur_attrs = topsis.current_attributes(cur, runtime_h, resolved, target_res)
     cur_clo, cur_raw = topsis.closeness_for_current_file(cur, runtime_h, resolved, target_res)
-    cur_nscore = cur_attrs["n_score"] if cur_attrs is not None else 0.0
-    cur_gbh = cur_raw.get("gbh", 0.0) or 0.0
     cur_res = cur_raw.get("resolution", 0) or 0
+    min_gain = resolved.min_closeness_gain
 
     rows = []
     legal: list[tuple[dict, dict, float]] = []
     for r in releases:
         attrs = topsis.attributes_for(r, runtime_h, resolved, target_res)
         clo = topsis.closeness(attrs, resolved.weights)
+        cand_res = attrs["raw"]["resolution"]
         rid = id(r)
         status = KEPT
         if rid not in id_size:
@@ -143,31 +138,23 @@ def analyze(
             status = "drop: lower score than current (allow_quality_downgrade=false)"
         elif rid not in id_hard:
             status = f"drop: hard reject ({_hard_reject_reason(r)})"
-        elif rid not in id_gbh:
-            floor = topsis.reference_for(_release_resolution(r))[0]
-            status = f"drop: below GiB/h floor ({attrs['raw']['gbh']:.2f} < {floor:.2f})"
+        elif rid not in id_band:
+            floor, _t, bloat = topsis.reference_for(cand_res, resolved.reference)
+            g = attrs["raw"]["gbh"]
+            where = f"{g:.2f} < floor {floor:.2f}" if g < floor else f"{g:.2f} > bloat {bloat:.2f}"
+            status = f"drop: outside size band ({where})"
         elif rid not in id_gap:
             if (r.get("customFormatScore") or 0) < 0:
                 status = "drop: negative score"
             else:
                 status = f"drop: score-gap cut (>{topsis.cfg.score_gap:.0%} below top cluster)"
+        elif swap_allowed(cur_clo, clo, cur_res, cand_res, target_res, min_gain):
+            legal.append((r, attrs, clo))
+        elif not resolution_ok(cur_res, cand_res, target_res):
+            status = "drop: swap gate (resolution below target)"
         else:
-            # survived to scoring -> run the transition gate vs the current file
-            deltas = classify(
-                cur_nscore=cur_nscore,
-                cand_nscore=attrs["n_score"],
-                cur_gbh=cur_gbh,
-                cand_gbh=attrs["raw"]["gbh"],
-                cur_res=cur_res,
-                cand_res=attrs["raw"]["resolution"],
-                cand_score=int(attrs["raw"]["score"] or 0),
-                t=resolved.transitions,
-            )
-            forbidden, reason = is_forbidden(deltas, resolved.transitions)
-            if forbidden:
-                status = f"drop: gate ({reason})"
-            else:
-                legal.append((r, attrs, clo))
+            delta = clo - (cur_clo if cur_clo is not None else 0.0)
+            status = f"drop: swap gate (Δcloseness {delta:+.3f} < {min_gain:.3f})"
         rows.append({"release": r, "attrs": attrs, "closeness": clo, "status": status})
 
     pick = topsis.select(legal, resolved)

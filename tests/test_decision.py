@@ -96,9 +96,10 @@ def test_decide_hold_on_bigger_file_without_score_gain():
 
 
 def test_decide_remux_refuses_lower_score_efficient_takes_it():
-    # slightly lower score, much smaller file.
+    # Lower score, smaller file: Efficient (size-leaning) gains closeness and takes it; Remux
+    # (score-dominated) does not, and the lean encode is also below Remux's size floor.
     current = _file(score=900_000, resolution="3840x2160", size_gb=20.0)  # 10 GiB/h
-    leaner = _release(guid="lean", score=850_000, resolution=2160, size_gb=7.0)  # 3.5 GiB/h
+    leaner = _release(guid="lean", score=850_000, resolution=2160, size_gb=9.0)  # 4.5 GiB/h
     d_eff = decide(_topsis(), [leaner], 2.0, "2160p Efficient", 2160, current_file=current)
     assert d_eff.action == "ACT"
     d_remux = decide(_topsis(), [leaner], 2.0, "2160p Remux", 2160, current_file=current)
@@ -133,7 +134,7 @@ def test_decide_drops_bigger_releases_when_size_increase_disallowed():
 
 def test_decide_drops_lower_score_releases_when_downgrade_disallowed():
     current = _file(score=800_000, resolution="3840x2160", size_gb=28.0)
-    higher = _release(guid="hi", score=1_000_000, resolution=2160, size_gb=32.0)
+    higher = _release(guid="hi", score=1_000_000, resolution=2160, size_gb=22.0)
     lower = _release(guid="lo", score=700_000, resolution=2160, size_gb=10.0)
     d = decide(
         _topsis(),
