@@ -138,3 +138,19 @@ def test_select_min_size_for_compact():
 def test_select_empty_returns_none():
     t = _topsis()
     assert t.select([], t.resolve_profile(None)) is None
+
+
+def test_current_resolution_prefers_quality_then_buckets_by_width():
+    t = _topsis()
+    # reliable: the file's own quality block wins, even when mediaInfo height is scope-short
+    assert (
+        t._current_resolution(
+            {"quality": {"quality": {"resolution": 2160}}, "mediaInfo": {"resolution": "3840x1608"}}
+        )
+        == 2160
+    )
+    # fallback (no quality): bucket by width, so scope 4K (3840x1608) -> 2160, not 1608
+    assert t._current_resolution({"mediaInfo": {"resolution": "3840x1608"}}) == 2160
+    assert t._current_resolution({"mediaInfo": {"resolution": "1920x800"}}) == 1080  # 1080p scope
+    assert t._current_resolution({"mediaInfo": {"resolution": "x2160"}}) == 2160  # height-only
+    assert t._current_resolution({}) == 0

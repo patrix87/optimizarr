@@ -156,6 +156,24 @@ def test_decide_hold_when_current_already_good():
     assert d.action == "HOLD"
 
 
+def test_decide_scope_4k_not_phantom_upgraded_to_same_class():
+    # Current is a 2.39:1 scope 4K file: its quality block says 2160p, even though the mediaInfo
+    # pixel height is 1608. A same-score 2160p candidate that is slightly BIGGER must NOT be
+    # grabbed: the current file's own quality (2160) makes resolution equal, so there is no
+    # closeness gain. (Regression: reading the 1608 pixel height looked like a 1608->2160 upgrade
+    # and justified the swap.)
+    current = {
+        "id": 7,
+        "customFormatScore": 924_600,
+        "size": int(12.4 * GB),  # 6.2 GiB/h at 2h
+        "quality": {"quality": {"resolution": 2160}},
+        "mediaInfo": {"resolution": "3840x1608"},
+    }
+    bigger_same_score = _release(guid="scope", score=924_600, resolution=2160, size_gb=12.8)
+    d = decide(_topsis(), [bigger_same_score], 2.0, "2160p Quality", 2160, current_file=current)
+    assert d.action == "HOLD"
+
+
 def test_decide_unknown_current_score_treated_as_upgrade():
     # current file with no customFormatScore -> any viable candidate is an improvement.
     current = {"id": 9, "size": int(30 * GB), "mediaInfo": {"resolution": "3840x2160"}}
