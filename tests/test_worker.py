@@ -34,12 +34,12 @@ def _release(guid="g1", score=1_000_000, resolution=2160, size_gb=14.0):
     }
 
 
-def _file(score=200_000, resolution="1920x1080", size_gb=30.0):
+def _file(score=200_000, resolution=1080, size_gb=30.0):
     return {
         "id": 555,
         "customFormatScore": score,
         "size": int(size_gb * GB),
-        "mediaInfo": {"resolution": resolution},
+        "quality": {"quality": {"resolution": resolution}},
     }
 
 
@@ -265,7 +265,7 @@ def test_process_one_hold_marks_satisfied(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
-        current_file=_file(score=1_000_000, resolution="3840x2160", size_gb=14.0),
+        current_file=_file(score=1_000_000, resolution=2160, size_gb=14.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
     entry = state.get("radarr", 1)
@@ -279,7 +279,7 @@ def test_process_one_act_grabs_without_marking(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
-        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
     assert len(adapter.grabbed) == 1
@@ -290,7 +290,7 @@ def test_process_one_dry_run_does_not_grab(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
-        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     _worker(state, dry_run=True)._process_one(_ctx(adapter), 1)
     assert adapter.grabbed == []
@@ -383,7 +383,7 @@ def test_importblocked_does_not_count_toward_import_gate(tmp_path):
     adapter = _GrabQueueAdapter(
         records,
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
-        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
     ctx.items_by_id = {1: {"id": 1}}
@@ -403,7 +403,7 @@ def test_process_app_once_consumes_head_of_pool_first(tmp_path):
     adapter = _GrabQueueAdapter(
         records=[],
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
-        current_file=_file(score=200_000, resolution="1920x1080", size_gb=30.0),
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
     ctx.items_by_id = {10: {"id": 10}, 20: {"id": 20}, 30: {"id": 30}}

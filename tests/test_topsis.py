@@ -140,17 +140,12 @@ def test_select_empty_returns_none():
     assert t.select([], t.resolve_profile(None)) is None
 
 
-def test_current_resolution_prefers_quality_then_buckets_by_width():
+def test_current_resolution_reads_quality_block():
     t = _topsis()
-    # reliable: the file's own quality block wins, even when mediaInfo height is scope-short
-    assert (
-        t._current_resolution(
-            {"quality": {"quality": {"resolution": 2160}}, "mediaInfo": {"resolution": "3840x1608"}}
-        )
-        == 2160
-    )
-    # fallback (no quality): bucket by width, so scope 4K (3840x1608) -> 2160, not 1608
-    assert t._current_resolution({"mediaInfo": {"resolution": "3840x1608"}}) == 2160
-    assert t._current_resolution({"mediaInfo": {"resolution": "1920x800"}}) == 1080  # 1080p scope
-    assert t._current_resolution({"mediaInfo": {"resolution": "x2160"}}) == 2160  # height-only
-    assert t._current_resolution({}) == 0
+    # the file's own quality bucket is the source, reliable even for scope content whose pixel
+    # height (mediaInfo) is misleadingly short
+    f = {"quality": {"quality": {"resolution": 2160}}, "mediaInfo": {"resolution": "3840x1608"}}
+    assert t._current_resolution(f) == 2160
+    assert t._current_resolution({"quality": {"quality": {"resolution": 1080}}}) == 1080
+    assert t._current_resolution({}) == 0  # unknown quality
+    assert t._current_resolution({"quality": {"quality": {}}}) == 0

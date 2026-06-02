@@ -267,7 +267,7 @@ def _file_from_record(c: dict | None) -> dict | None:
         "id": 1,
         "customFormatScore": c.get("score"),
         "size": c.get("size_bytes") or 0,
-        "mediaInfo": {"resolution": f"x{c.get('resolution') or 0}"},
+        "quality": {"quality": {"resolution": c.get("resolution") or 0}},
     }
 
 

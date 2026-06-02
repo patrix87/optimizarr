@@ -27,7 +27,7 @@ def _file(score, res, size_gb):
         "id": 1,
         "customFormatScore": score,
         "size": int(size_gb * GB),
-        "mediaInfo": {"resolution": f"x{res}"},
+        "quality": {"quality": {"resolution": res}},
     }
 
 

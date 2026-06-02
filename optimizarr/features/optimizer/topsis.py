@@ -43,31 +43,6 @@ def _release_resolution(release: dict) -> int:
     return ((release.get("quality") or {}).get("quality") or {}).get("resolution") or 0
 
 
-def _bucket_resolution(width: int, height: int) -> int:
-    """Snap raw pixel dimensions to a standard resolution bucket (2160/1080/720/480), matching the
-    nominal `quality.resolution` candidates report. Bucket by WIDTH when known: scope (~2.40:1)
-    content keeps full width but a short height (e.g. 3840x1608), so reading the height would make
-    a 4K scope file look like '1608p' and produce phantom resolution upgrades against a 2160p
-    candidate of the same class. Falls back to height when width is unknown."""
-    if width > 0:
-        if width >= 3000:
-            return 2160
-        if width >= 1700:
-            return 1080
-        if width >= 1100:
-            return 720
-        return 480
-    if height >= 1601:
-        return 2160
-    if height >= 721:
-        return 1080
-    if height >= 620:
-        return 720
-    if height >= 400:
-        return 480
-    return height
-
-
 def eligible(releases: list[dict]) -> list[dict]:
     """Drop hard-rejected releases (blocklist, parse failure, dead torrents)."""
     keep = []
@@ -258,24 +233,11 @@ class Topsis:
         return 0.0 if total == 0 else d_anti / total
 
     def _current_resolution(self, movie_file: dict) -> int:
-        """The library file's resolution as a standard bucket, matching candidates' nominal
-        `quality.resolution`. The file's own `quality` block (e.g. Bluray-1080p / WEBDL-2160p) is
-        the reliable source, so use it directly. Only fall back to bucketing the raw mediaInfo
-        'WxH' pixels (by width, so scope content lands right) when quality is absent."""
-        q_res = ((movie_file.get("quality") or {}).get("quality") or {}).get("resolution")
-        if q_res:
-            return int(q_res)
-        mi = movie_file.get("mediaInfo") or {}
-        res_str = mi.get("resolution") or ""
-        if "x" not in res_str:
-            return 0
-        parts = res_str.split("x")
-        width = int(parts[0]) if parts[0].strip().lstrip("-").isdigit() else 0
-        try:
-            height = int(parts[1])
-        except (IndexError, ValueError):
-            height = 0
-        return _bucket_resolution(width, height)
+        """The library file's resolution bucket, read from its own `quality` block (Bluray-1080p /
+        WEBDL-2160p etc.) — the same nominal field candidates report, so the two are comparable.
+        This is reliable even for scope (2.40:1) content, whose raw pixel height is misleadingly
+        short. Returns 0 if the quality is unknown."""
+        return int(((movie_file.get("quality") or {}).get("quality") or {}).get("resolution") or 0)
 
     def current_attributes(
         self,

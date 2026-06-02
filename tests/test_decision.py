@@ -19,12 +19,12 @@ def _release(guid="g1", score=1_000_000, resolution=2160, size_gb=13.0):
     }
 
 
-def _file(score=200_000, resolution="1920x1080", size_gb=30.0):
+def _file(score=200_000, resolution=1080, size_gb=30.0):
     return {
         "id": 555,
         "customFormatScore": score,
         "size": int(size_gb * GB),
-        "mediaInfo": {"resolution": resolution},
+        "quality": {"quality": {"resolution": resolution}},
     }
 
 
@@ -36,7 +36,7 @@ def test_format_decision_act_shows_current_and_pick():
         2.0,
         "2160p Quality",
         2160,
-        current_file=_file(score=200_000, resolution="1920x1080"),
+        current_file=_file(score=200_000, resolution=1080),
     )
     msg = format_decision("radarr", "Movie (2024)", d, dry_run=True)
     assert "would GRAB" in msg
@@ -48,7 +48,7 @@ def test_format_decision_act_shows_current_and_pick():
 def test_format_decision_hold_when_nothing_better():
     # Current already at the candidate's exact spec -> no legal transition -> HOLD.
     releases = [_release(score=1_000_000, resolution=2160, size_gb=13.0)]
-    current = _file(score=1_000_000, resolution="3840x2160", size_gb=13.0)
+    current = _file(score=1_000_000, resolution=2160, size_gb=13.0)
     d = decide(_topsis(), releases, 2.0, "2160p Quality", 2160, current_file=current)
     assert d.action == "HOLD"
     msg = format_decision("radarr", "Movie (2024)", d, dry_run=False)
@@ -71,7 +71,7 @@ def test_decide_act_on_clear_upgrade():
         2.0,
         "2160p Quality",
         2160,
-        current_file=_file(score=200_000, resolution="1920x1080"),
+        current_file=_file(score=200_000, resolution=1080),
     )
     assert d.action == "ACT"
     assert d.release is not None and d.release["guid"] == "g1"
@@ -79,7 +79,7 @@ def test_decide_act_on_clear_upgrade():
 
 def test_decide_act_smaller_at_equal_score():
     # Same res + score, meaningfully smaller -> a free size win for any profile.
-    current = _file(score=900_000, resolution="3840x2160", size_gb=24.0)  # 12 GiB/h
+    current = _file(score=900_000, resolution=2160, size_gb=24.0)  # 12 GiB/h
     smaller = _release(guid="lean", score=900_000, resolution=2160, size_gb=13.0)  # 6.5 GiB/h
     d = decide(_topsis(), [smaller], 2.0, "2160p Efficient", 2160, current_file=current)
     assert d.action == "ACT"
@@ -88,7 +88,7 @@ def test_decide_act_smaller_at_equal_score():
 
 def test_decide_hold_on_bigger_file_without_score_gain():
     # Bigger at same res + same score must never be grabbed.
-    current = _file(score=900_000, resolution="3840x2160", size_gb=13.0)
+    current = _file(score=900_000, resolution=2160, size_gb=13.0)
     bigger = _release(guid="big", score=900_000, resolution=2160, size_gb=24.0)
     d = decide(_topsis(), [bigger], 2.0, "2160p Efficient", 2160, current_file=current)
     assert d.action == "HOLD"
@@ -98,7 +98,7 @@ def test_decide_hold_on_bigger_file_without_score_gain():
 def test_decide_remux_refuses_lower_score_efficient_takes_it():
     # Lower score, smaller file: Efficient (size-leaning) gains closeness and takes it; Remux
     # (score-dominated) does not, and the lean encode is also below Remux's size floor.
-    current = _file(score=900_000, resolution="3840x2160", size_gb=20.0)  # 10 GiB/h
+    current = _file(score=900_000, resolution=2160, size_gb=20.0)  # 10 GiB/h
     leaner = _release(guid="lean", score=850_000, resolution=2160, size_gb=9.0)  # 4.5 GiB/h
     d_eff = decide(_topsis(), [leaner], 2.0, "2160p Efficient", 2160, current_file=current)
     assert d_eff.action == "ACT"
@@ -107,7 +107,7 @@ def test_decide_remux_refuses_lower_score_efficient_takes_it():
 
 
 def test_decide_compact_picks_smallest_legal():
-    current = _file(score=900_000, resolution="3840x2160", size_gb=24.0)  # 12 GiB/h
+    current = _file(score=900_000, resolution=2160, size_gb=24.0)  # 12 GiB/h
     a = _release(guid="a", score=900_000, resolution=2160, size_gb=13.0)  # 6.5 GiB/h
     b = _release(guid="b", score=880_000, resolution=2160, size_gb=8.0)  # 4 GiB/h, slightly lower
     d = decide(_topsis(), [a, b], 2.0, "Compact", 2160, current_file=current)
@@ -116,7 +116,7 @@ def test_decide_compact_picks_smallest_legal():
 
 
 def test_decide_drops_bigger_releases_when_size_increase_disallowed():
-    current = _file(score=400_000, resolution="3840x2160", size_gb=20.0)
+    current = _file(score=400_000, resolution=2160, size_gb=20.0)
     bigger = _release(guid="big", score=1_000_000, resolution=2160, size_gb=30.0)
     smaller = _release(guid="small", score=900_000, resolution=2160, size_gb=13.0)
     d = decide(
@@ -133,7 +133,7 @@ def test_decide_drops_bigger_releases_when_size_increase_disallowed():
 
 
 def test_decide_drops_lower_score_releases_when_downgrade_disallowed():
-    current = _file(score=800_000, resolution="3840x2160", size_gb=28.0)
+    current = _file(score=800_000, resolution=2160, size_gb=28.0)
     higher = _release(guid="hi", score=1_000_000, resolution=2160, size_gb=22.0)
     lower = _release(guid="lo", score=700_000, resolution=2160, size_gb=10.0)
     d = decide(
@@ -151,7 +151,7 @@ def test_decide_drops_lower_score_releases_when_downgrade_disallowed():
 
 def test_decide_hold_when_current_already_good():
     releases = [_release(score=1_000_000, resolution=2160, size_gb=13.0)]
-    current = _file(score=1_000_000, resolution="3840x2160", size_gb=13.0)
+    current = _file(score=1_000_000, resolution=2160, size_gb=13.0)
     d = decide(_topsis(), releases, 2.0, "2160p Quality", 2160, current_file=current)
     assert d.action == "HOLD"
 
