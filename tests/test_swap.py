@@ -71,16 +71,18 @@ def test_swap_resolution_guard_overrides_a_big_gain():
 # ----- the "no senseless swap" property falls out of closeness -----
 
 
-def test_lower_score_bigger_or_equal_is_never_grabbed():
-    """Same resolution, score <= current and size >= current cannot raise closeness, so it is
-    never grabbed — for any preset. (No explicit rule needed; it follows from the gate.)"""
+def test_bigger_at_no_score_gain_is_never_grabbed():
+    """A bigger file with a lower-OR-equal score is never grabbed, for any preset and any current
+    size. The peaked trapezoid no longer guarantees this for free (a bigger, nearer-the-band
+    release can out-score a too-small current file), so decide() enforces it explicitly: you only
+    accept a larger file when it is a genuine score upgrade."""
     rnd = random.Random(7)
     for profile in PRESETS:
         for _ in range(400):
             cur_score = rnd.randint(0, 1_000_000)
-            cur_gbh = round(rnd.uniform(4.0, 12.0), 2)
+            cur_gbh = round(rnd.uniform(0.6, 12.0), 2)  # anywhere, including below the band
             cand_score = rnd.randint(0, cur_score)  # <= current
-            cand_gbh = round(rnd.uniform(cur_gbh, 18.0), 2)  # >= current
+            cand_gbh = round(rnd.uniform(cur_gbh + 0.5, 22.0), 2)  # strictly bigger
             cur = _file(cur_score, 2160, cur_gbh * 2)  # runtime 2h: gbh = size_gb / 2
             cand = _release(cand_score, 2160, cand_gbh * 2)
             d = decide(T, [cand], 2.0, f"2160p {profile}", 2160, current_file=cur)

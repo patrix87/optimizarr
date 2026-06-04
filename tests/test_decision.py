@@ -95,24 +95,27 @@ def test_decide_hold_on_bigger_file_without_score_gain():
     assert d.reason == "nothing better"
 
 
-def test_decide_remux_refuses_lower_score_efficient_takes_it():
-    # Lower score, smaller file: Efficient (size-leaning) gains closeness and takes it; Remux
-    # (score-dominated) does not, and the lean encode is also below Remux's size floor.
-    current = _file(score=900_000, resolution=2160, size_gb=20.0)  # 10 GiB/h
-    leaner = _release(guid="lean", score=850_000, resolution=2160, size_gb=9.0)  # 4.5 GiB/h
+def test_decide_efficient_pulls_toward_band_remux_does_not():
+    # A release nearer Efficient's band (lower bitrate) at a slightly lower score raises closeness
+    # for Efficient (size-leaning, band ~7.8 GiB/h); Remux refuses it (8 GiB/h is below Remux's
+    # floor, so it is dropped before scoring).
+    current = _file(score=900_000, resolution=2160, size_gb=24.0)  # 12 GiB/h, above Efficient band
+    leaner = _release(guid="lean", score=850_000, resolution=2160, size_gb=16.0)  # 8 GiB/h, in band
     d_eff = decide(_topsis(), [leaner], 2.0, "2160p Efficient", 2160, current_file=current)
     assert d_eff.action == "ACT"
     d_remux = decide(_topsis(), [leaner], 2.0, "2160p Remux", 2160, current_file=current)
     assert d_remux.action == "HOLD"
 
 
-def test_decide_compact_picks_smallest_legal():
-    current = _file(score=900_000, resolution=2160, size_gb=24.0)  # 12 GiB/h
-    a = _release(guid="a", score=900_000, resolution=2160, size_gb=13.0)  # 6.5 GiB/h
-    b = _release(guid="b", score=880_000, resolution=2160, size_gb=8.0)  # 4 GiB/h, slightly lower
-    d = decide(_topsis(), [a, b], 2.0, "Compact", 2160, current_file=current)
+def test_decide_compact_picks_near_its_band_not_the_smallest():
+    # Sweet-spot model: Compact aims at its band (~P10, 6.8 GiB/h at 2160), not the absolute
+    # smallest. A near-peak release beats a tinier one that has dropped below the band.
+    current = _file(score=900_000, resolution=2160, size_gb=24.0)  # 12 GiB/h, above the band
+    near = _release(guid="near", score=900_000, resolution=2160, size_gb=13.0)  # 6.5 GiB/h, in band
+    tiny = _release(guid="tiny", score=880_000, resolution=2160, size_gb=8.0)  # 4 GiB/h, below band
+    d = decide(_topsis(), [near, tiny], 2.0, "Compact", 2160, current_file=current)
     assert d.action == "ACT"
-    assert d.release is not None and d.release["guid"] == "b"  # min_size among legal survivors
+    assert d.release is not None and d.release["guid"] == "near"
 
 
 def test_decide_drops_bigger_releases_when_size_increase_disallowed():

@@ -1,19 +1,22 @@
 """TOPSIS-based release scorer + per-profile pickers.
 
-Multi-objective release scoring. Three axes, each normalized to [0,1]:
-  - score:      Profilarr customFormatScore, fixed scale [anti_ideal, ideal] (higher better)
-  - resolution: pixel height toward the profile target (higher better, low weight — Profilarr
-                already folds resolution into score, so this axis mostly avoids double-counting)
-  - size:       GiB/h on a ONE-SIDED curve — n_size = 1.0 at/below the preset's `target`,
-                ramping to 0 at the preset's `bloat`. Smaller than the target is never penalized,
-                so nothing is ever inflated to "reach" a target.
+Multi-objective release scoring on TWO axes, each normalized to [0,1]:
+  - score: Profilarr customFormatScore through a fixed transform (logistic by default), higher
+           better. Resolution is NOT a scored axis — Profilarr folds it into the score, and a hard
+           guard in decision.py forbids dropping below the profile target.
+  - size:  GiB/h on a 5-point TRAPEZOID `{floor, lo, target, hi, ceiling}` — n_size is 0 outside
+           [floor, ceiling], rises to `size_shoulder` at lo, peaks at 1.0 at target, falls back to
+           `size_shoulder` at hi. The flat-ish [lo, hi] band is the profile's "good size" region:
+           inside it score drives the pick; outside it the steep shoulders pull back toward the
+           band. A too-small file IS now penalized (so it can be replaced by one nearer the band).
 
-Inclusion (before scoring): drop hard rejections, drop outside the preset's per-resolution size
-band (gbh < floor = fakes/upscales, gbh > bloat = bloat), then gap-cut the score tail.
+Inclusion (before scoring): drop hard rejections, drop outside the per-resolution size band
+(gbh < floor or gbh > ceiling), gap-cut the score tail, then drop lone-small size outliers.
 
-The size table `{floor, target, bloat}` is now PER-PRESET (config-driven): each resolved profile
-carries its own table + weights + pick + a `min_closeness_gain` swap margin. The swap rule lives
-in decision.py (a closeness-gain test); this module scores and picks among the survivors.
+The size table is PER-PRESET (config-driven): each resolved profile carries its own table +
+weights + pick + a `min_closeness_gain` swap margin. The swap rule lives in decision.py (a
+closeness-gain test); closeness is a fixed function of the release alone, so the optimizer is
+provably non-oscillating (every swap strictly raises it). This module scores and picks survivors.
 """
 
 from __future__ import annotations
@@ -96,8 +99,10 @@ class Topsis:
             weights=weights, pick=pick, reference=reference, min_closeness_gain=min_gain
         )
 
-    def reference_for(self, res: int, reference: Reference) -> tuple[float, float, float]:
-        """A preset's (floor, target, bloat) for a resolution; nearest-defined-at-or-below."""
+    def reference_for(
+        self, res: int, reference: Reference
+    ) -> tuple[float, float, float, float, float]:
+        """(floor, lo, target, hi, ceiling) for a resolution; nearest defined at or below."""
         if res in reference:
             return reference[res]
         keys = sorted(reference)
@@ -110,14 +115,29 @@ class Topsis:
         self, releases: list[dict], runtime_h: float, reference: Reference
     ) -> list[dict]:
         """Drop releases outside the preset's per-resolution size band: below `floor` (fakes /
-        upscales / too-soft-for-the-resolution) or above `bloat` (bloated)."""
+        upscales / too-soft-for-the-resolution) or above `ceiling` (bloated)."""
         keep = []
         for r in releases:
-            floor, _target, bloat = self.reference_for(_release_resolution(r), reference)
+            floor, _lo, _target, _hi, ceiling = self.reference_for(
+                _release_resolution(r), reference
+            )
             gbh = _release_gbh(r, runtime_h)
-            if floor <= gbh <= bloat:
+            if floor <= gbh <= ceiling:
                 keep.append(r)
         return keep
+
+    def drop_size_outliers(self, releases: list[dict], runtime_h: float) -> list[dict]:
+        """Drop a release whose GiB/h is a lone outlier below the comparable-score cluster: below
+        `outlier_frac x median(cluster GiB/h)`. "A good encode has corroborating peers", so a single
+        suspiciously-small release among bigger ones (likely a bad encode) is never targeted. Run on
+        the gap-cut survivors so "comparable-score" holds. Disabled when outlier_frac <= 0."""
+        frac = self.cfg.outlier_frac
+        if frac <= 0 or len(releases) < 3:
+            return releases
+        gbhs = sorted(_release_gbh(r, runtime_h) for r in releases)
+        mid = len(gbhs) // 2
+        median = gbhs[mid] if len(gbhs) % 2 else (gbhs[mid - 1] + gbhs[mid]) / 2
+        return [r for r in releases if _release_gbh(r, runtime_h) >= frac * median]
 
     def filter_by_score_gap(self, releases: list[dict]) -> list[dict]:
         """Keep the top score cluster: sort desc, scan high->low, cut at the first consecutive
@@ -144,60 +164,66 @@ class Topsis:
         diag["after_hard_rejections"] = len(after_hard)
         after_band = self.filter_by_size_band(after_hard, runtime_h, reference)
         diag["after_size_band"] = len(after_band)
-        kept = self.filter_by_score_gap(after_band)
-        diag["after_score_gap"] = len(kept)
-        diag["inclusion"] = f"size band + gap-cut (>{self.cfg.score_gap:.0%} drop)"
+        after_gap = self.filter_by_score_gap(after_band)
+        diag["after_score_gap"] = len(after_gap)
+        kept = self.drop_size_outliers(after_gap, runtime_h)
+        diag["after_outlier_drop"] = len(kept)
+        diag["inclusion"] = f"size band + gap-cut (>{self.cfg.score_gap:.0%} drop) + outlier drop"
         return kept, diag
 
     # ----- normalization -----
 
     def normalize_score(self, s: float) -> float:
         cfg = self.cfg
+        if cfg.score_norm == "logistic":
+            # S-curve centered at score_center. Profilarr scores bunch near the top (~950k) and
+            # fall off below, so a logistic puts the axis's resolution where releases actually
+            # compete, instead of wasting most of [0,1] on scores no release reaches. No hard
+            # cutoff: a library whose scores all sit near one value still gets spread out.
+            z = (s - cfg.score_center) / cfg.score_width
+            if z <= -60:
+                return 0.0
+            if z >= 60:
+                return 1.0
+            return 1.0 / (1.0 + math.exp(-z))
         if s >= cfg.score_ideal:
             return 1.0
         if s <= cfg.score_anti_ideal:
             return 0.0
         return (s - cfg.score_anti_ideal) / (cfg.score_ideal - cfg.score_anti_ideal)
 
-    def normalize_resolution(self, r: int, target: int | None = None) -> float:
-        cfg = self.cfg
-        ideal = target if target else cfg.resolution_ideal
-        if r >= ideal:
-            return 1.0
-        if r <= cfg.resolution_anti_ideal:
+    def normalize_size(
+        self, gbh: float, floor: float, lo: float, target: float, hi: float, ceiling: float
+    ) -> float:
+        """5-point trapezoid: 0 outside [floor, ceiling], rising to `size_shoulder` at lo, peaking
+        at 1.0 at target, falling back to `size_shoulder` at hi. The flat-ish [lo, hi] band is the
+        "good size" region for the profile; inside it score drives the pick, and the gentle slope to
+        target lets `target` placement nudge the preference. Unlike the old one-sided curve, a
+        too-small file IS penalized (it can be replaced by one nearer the band)."""
+        sh = self.cfg.size_shoulder
+        if gbh <= floor or gbh >= ceiling:
             return 0.0
-        return (r - cfg.resolution_anti_ideal) / (ideal - cfg.resolution_anti_ideal)
-
-    def normalize_size(self, gbh: float, target: float, bloat: float) -> float:
-        """One-sided cost curve: 1.0 at or below `target`, linear down to 0 at `bloat`. Smaller
-        than the target is never penalized — that is what keeps the optimizer from ever inflating
-        a file to reach a target."""
+        if gbh < lo:
+            return sh * (gbh - floor) / (lo - floor) if lo > floor else sh
         if gbh <= target:
-            return 1.0
-        if gbh >= bloat or bloat <= target:
-            return 0.0
-        return (bloat - gbh) / (bloat - target)
+            return sh + (1 - sh) * (gbh - lo) / (target - lo) if target > lo else 1.0
+        if gbh <= hi:
+            return 1.0 - (1 - sh) * (gbh - target) / (hi - target) if hi > target else 1.0
+        return sh * (ceiling - gbh) / (ceiling - hi) if ceiling > hi else sh
 
     def _attrs(
-        self,
-        score: float,
-        res: int,
-        gbh: float,
-        size_gb: float,
-        resolved: ResolvedProfile,
-        target_resolution: int | None,
+        self, score: float, res: int, gbh: float, size_gb: float, resolved: ResolvedProfile
     ) -> dict:
-        floor, target, bloat = self.reference_for(res, resolved.reference)
+        floor, lo, target, hi, ceiling = self.reference_for(res, resolved.reference)
         return {
             "n_score": self.normalize_score(score or 0),
-            "n_resolution": self.normalize_resolution(res, target_resolution),
-            "n_size": self.normalize_size(gbh, target, bloat),
+            "n_size": self.normalize_size(gbh, floor, lo, target, hi, ceiling),
             "raw": {
                 "score": score,
                 "resolution": res,
                 "gbh": gbh,
                 "size_gb": size_gb,
-                "reference": (floor, target, bloat),
+                "reference": (floor, lo, target, hi, ceiling),
                 "target": target,
             },
         }
@@ -209,7 +235,8 @@ class Topsis:
         resolved: ResolvedProfile,
         target_resolution: int | None = None,
     ) -> dict:
-        """Normalized [0,1] attributes + raw values for one release."""
+        """Normalized [0,1] attributes + raw values for one release. (target_resolution is accepted
+        for call-site symmetry but unused: resolution is a guard in decision.py, not an axis.)"""
         size_bytes = release.get("size", 0)
         return self._attrs(
             release.get("customFormatScore", 0),
@@ -217,16 +244,11 @@ class Topsis:
             _release_gbh(release, runtime_h),
             size_bytes / GB,
             resolved,
-            target_resolution,
         )
 
     def closeness(self, attrs: dict, weights: dict[str, float]) -> float:
-        """TOPSIS closeness in [0,1]. 1 = ideal, 0 = anti-ideal."""
-        w = {
-            "n_score": weights["score"],
-            "n_resolution": weights["resolution"],
-            "n_size": weights["size"],
-        }
+        """TOPSIS closeness in [0,1] over the two axes (score, size). 1 = ideal, 0 = anti-ideal."""
+        w = {"n_score": weights["score"], "n_size": weights["size"]}
         d_ideal = math.sqrt(sum(w[k] * (1.0 - attrs[k]) ** 2 for k in w))
         d_anti = math.sqrt(sum(w[k] * attrs[k] ** 2 for k in w))
         total = d_ideal + d_anti
@@ -254,7 +276,7 @@ class Topsis:
         size_gb = size / GB
         gbh = (size_gb / runtime_h) if (runtime_h and runtime_h > 0) else 0.0
         res = self._current_resolution(movie_file)
-        return self._attrs(score, res, gbh, size_gb, resolved, target_resolution)
+        return self._attrs(score, res, gbh, size_gb, resolved)
 
     def closeness_for_current_file(
         self,

@@ -10,73 +10,84 @@ anything better than the current file*, never merely *"we triggered a grab."*
 
 There are two big ideas:
 
-- **Per-preset absolute size tables.** Each preset carries its own `{floor, target, bloat}` band
-  per resolution (GiB/h). `floor` and `bloat` are hard gates (out-of-band releases are dropped
-  before scoring); `target` is where the size score plateaus. The curve is **one-sided**, so a
-  file is never inflated to "reach" a target.
-- **A single closeness-gain swap rule.** Releases are scored by TOPSIS *closeness* (a number
-  derived from the release alone), and a candidate is grabbed only if it raises closeness past a
-  small margin, plus a resolution guard. Because closeness is file-independent and strictly
-  increases on every swap, the optimizer **cannot oscillate**, for cycles of any length.
+- **Per-preset 5-point size bands.** Each preset carries its own
+  `{floor, lo, target, hi, ceiling}` trapezoid per resolution (GiB/h). `floor` and `ceiling` are
+  hard gates (out-of-band releases are dropped before scoring); `lo … hi` is the "good size" band
+  where score drives the pick; `target` is the peak, placed at a per-profile size percentile, so
+  each profile aims at a different size and the five profiles pick different releases.
+- **A single closeness-gain swap rule.** Releases are scored by TOPSIS *closeness* over two axes
+  (score, size; resolution is a hard guard, not an axis), and a candidate is grabbed only if it
+  raises closeness past a small margin, doesn't drop resolution below target, and isn't bigger at a
+  lower-or-equal score (a larger file is grabbed only on a real score upgrade). Because closeness is
+  file-independent and strictly increases on every swap, the optimizer **cannot oscillate**.
 
 ---
 
-## 1. The size model: per-preset tables, one-sided curve
+## 1. The size model: per-preset tables, 5-point trapezoid
 
 Each preset defines its own `[optimizer.topsis.presets.<name>.reference]` table: one
-`{floor, target, bloat}` entry per resolution, in GiB/h (`GB = 1024³`, so GiB). The shipped
-tables (floor / target / bloat):
+`{floor, lo, target, hi, ceiling}` entry per resolution, in GiB/h (`GB = 1024³`, so GiB). The
+shipped 2160p and 1080p bands (floor / lo / target / hi / ceiling); 720p and 480p follow the same
+shape, scaled down:
 
-| preset | 2160 | 1080 | 720 | 480 |
-| --- | --- | --- | --- | --- |
-| Remux | 15 / 35 / 80 | 8 / 18 / 40 | 2 / 5 / 12 | 0.5 / 1.5 / 4 |
-| Quality | 5 / 11 / 20 | 1.5 / 5 / 10 | 0.5 / 2 / 5 | 0.25 / 0.8 / 3 |
-| Balanced | 4.5 / 9 / 16 | 1.5 / 3.8 / 8 | 0.5 / 1.5 / 4 | 0.2 / 0.6 / 2.5 |
-| Efficient | 3.5 / 6.5 / 14 | 1 / 2.6 / 7 | 0.4 / 1 / 3.5 | 0.2 / 0.45 / 2 |
-| Compact | 3 / 5 / 12 | 1 / 2 / 6 | 0.35 / 0.8 / 3 | 0.2 / 0.35 / 2 |
+| preset | 2160p | 1080p |
+| --- | --- | --- |
+| Remux | 15 / 28 / 38 / 60 / 90 | 8 / 15 / 20 / 32 / 48 |
+| Quality | 6.5 / 10.7 / 11.5 / 13.5 / 30 | 3 / 5 / 6.3 / 8.7 / 16 |
+| Balanced | 5 / 8.1 / 9.3 / 11 / 20 | 2 / 3.8 / 4.5 / 5.3 / 10 |
+| Efficient | 4 / 7.1 / 7.8 / 8.8 / 15 | 1.5 / 2.8 / 3.5 / 4.3 / 7.5 |
+| Compact | 3.5 / 5.9 / 6.8 / 7.6 / 12 | 1.2 / 1.9 / 2.6 / 3.2 / 6 |
 
-- **floor**: below this a release is illegitimate for the resolution (an upscale, a mislabeled
-  lower resolution, or an encode too soft to deliver it). Dropped before scoring.
-- **target**: where the size score plateaus. A *good* release for this preset sits here or below.
-- **bloat**: above this is bloat. Dropped before scoring, and size desirability is 0 at `bloat`.
+- **floor / ceiling**: legitimacy bounds. Outside `[floor, ceiling]` a release is dropped before
+  scoring (too soft / fake below floor, bloated above ceiling), and `n_size = 0` there.
+- **lo … hi**: the "good size" band. `n_size = size_shoulder` (default 0.85) at lo and hi, so
+  inside the band size barely moves the decision and **score drives** the pick.
+- **target**: the peak (`n_size = 1.0`), placed at a per-profile percentile of real release sizes
+  (Compact ~P10, Efficient ~P30, Balanced ~P50, Quality ~P77, Remux at remux bitrates). Slide
+  `target` within the band to nudge a profile lower or higher.
 
-The size-desirability curve is **one-sided**:
+The size-desirability curve is a **trapezoid** (a flat-topped tent):
 
 ```
-n_size(gbh) = 1.0                          if gbh ≤ target        (plateau, smaller never punished)
-            = (bloat − gbh)/(bloat − target)   if target < gbh < bloat   (linear ramp down)
-            = 0.0                          if gbh ≥ bloat
+n_size(gbh) = 0                                          if gbh ≤ floor or gbh ≥ ceiling
+            = shoulder·(gbh−floor)/(lo−floor)            if floor < gbh < lo    (rise to the band)
+            = shoulder + (1−shoulder)·(gbh−lo)/(target−lo)   if lo ≤ gbh ≤ target
+            = 1 − (1−shoulder)·(gbh−target)/(hi−target)      if target < gbh ≤ hi
+            = shoulder·(ceiling−gbh)/(ceiling−hi)        if hi < gbh < ceiling  (fall past the band)
 ```
 
-Two consequences make this safe for a space-saving tool:
-
-- **Nothing is ever inflated.** A file already at or below `target` scores `n_size = 1.0`, so
-  TOPSIS has no reason to swap it for a bigger one. A tiny, good-scoring file stays.
-- **Among files at/below `target`, size ties at 1.0, so score breaks the tie**, i.e. "small
-  enough, then best score," which is exactly "good *and* small."
-
-Tables differ by taste: size-leaning presets (Efficient, Compact) sit low, so they admit and aim
-at lean encodes; Remux sits at remux bitrates, so its floor rejects ordinary encodes.
+Each profile aims at a **different** band, so the five profiles pick different releases for the
+same movie. Unlike the old one-sided curve, a too-small file is penalized (it sits on the rising
+shoulder, not a plateau) — but it is never actually *grown* unless that is a genuine score upgrade
+(§3). A lone tiny release among bigger same-score peers (usually a bad encode) is dropped by an
+outlier prefilter: anything below `outlier_frac` (default 0.5) × the median GiB/h of the
+gap-cut cluster. "A good encode has corroborating peers."
 
 ---
 
-## 2. Scoring: TOPSIS over three axes
+## 2. Scoring: TOPSIS over two axes
 
-Each surviving release is described by three attributes, all normalized to `[0, 1]`:
+Resolution is **not** a scored axis: Profilarr already folds it into the score, and a hard guard
+forbids dropping below the profile target (§3). So each surviving release has two normalized
+attributes:
 
 ```
-n_score      = clamp( (score − score_anti_ideal) / (score_ideal − score_anti_ideal), 0, 1 )
-n_resolution = clamp( (height − res_anti_ideal)  / (target_height − res_anti_ideal),  0, 1 )
-n_size       = one-sided curve above (uses the preset's target + bloat for this resolution)
+n_score = 1 / (1 + exp(-(score − score_center) / score_width))   # logistic (default)
+n_size  = trapezoid above (the preset's floor/lo/target/hi/ceiling for this resolution)
 ```
 
-Score normalizes on a **fixed** scale (`[0, 1,000,000]` by default) so good releases stay
-comparable across items. Resolution climbs toward the profile's target height (low weight on
-purpose, since Profilarr already folds resolution into the score, so this axis mostly avoids
-double-counting).
+Score normalizes through a **fixed** transform (a function of the release alone, so closeness
+stays comparable across items and the no-oscillation guarantee in §3 holds). The default is a
+**logistic** S-curve: Profilarr scores bunch tightly near the top (real releases top out around
+~950k and cluster there) then fall off fast, so a logistic concentrates the `[0,1]` range where
+releases actually compete. A linear ramp over `[0, 1,000,000]` wastes ~80% of the axis on scores
+no release reaches, which lets a small real score difference at the top get drowned out by the
+size axis; the logistic fixes that and, having no hard floor, still separates a library whose
+scores all sit near one value. `score_center` (n_score = 0.5) and `score_width` (slope) are set
+in `[optimizer.topsis]`; `score_norm = "linear"` restores the old fixed ramp.
 
-A profile's **weights** (summing to 1.0) combine the axes into a TOPSIS *closeness*, the distance
-to the ideal point `(1,1,1)` vs the anti-ideal `(0,0,0)`:
+A profile's **weights** (score + size, summing to 1.0) combine the axes into a TOPSIS *closeness*,
+the distance to the ideal point `(1,1)` vs the anti-ideal `(0,0)`:
 
 ```
 d_ideal = √( Σ wₖ·(1 − aₖ)² )
@@ -86,16 +97,17 @@ closeness = d_anti / (d_ideal + d_anti)        # 1 = ideal, 0 = anti-ideal
 
 Shipped weights and pick method:
 
-| Profile | score | resolution | size | pick method |
-| --- | --- | --- | --- | --- |
-| Remux | 0.80 | 0.15 | 0.05 | `max_score` |
-| Quality | 0.65 | 0.15 | 0.20 | `topsis` |
-| Balanced | 0.50 | 0.10 | 0.40 | `topsis` |
-| Efficient | 0.40 | 0.10 | 0.50 | `topsis` |
-| Compact | 0.20 | 0.10 | 0.70 | `min_size` |
+| Profile | score | size | pick method |
+| --- | --- | --- | --- |
+| Remux | 0.94 | 0.06 | `topsis` |
+| Quality | 0.86 | 0.14 | `topsis` |
+| Balanced | 0.56 | 0.44 | `topsis` |
+| Efficient | 0.44 | 0.56 | `topsis` |
+| Compact | 0.22 | 0.78 | `topsis` |
 
-`max_score` (Remux) and `min_size` (Compact) are deterministic single-axis picks among the legal
-candidates; the middle three blend score vs size, which is what TOPSIS is for.
+All presets pick by `topsis` (highest closeness); the profiles diverge because their **bands** sit
+at different sizes, not because of the pick method. `max_score` and `min_size` remain available for
+profile overrides.
 
 ---
 
@@ -106,13 +118,14 @@ flowchart TD
     A["Item selected"] --> RP["Resolve profile → preset<br/>(name-keyword match or override)"]
     RP --> B["GET /api/v3/release"]
     B --> C["Pre-filter 1: drop hard rejections<br/>blocklisted · unparseable · wrong item · dead"]
-    C --> D["Pre-filter 2: drop outside the preset's size band<br/>gbh < floor (fake/upscale) or gbh > bloat (bloat)"]
+    C --> D["Pre-filter 2: drop outside the preset's size band<br/>gbh < floor (fake/upscale) or gbh > ceiling (bloat)"]
     D --> E["Pre-filter 3: gap-cut on score<br/>keep the top cluster; cut at first drop > score_gap"]
-    E --> SC["Score survivors (TOPSIS closeness)"]
-    SC --> GATE["SWAP RULE<br/>keep candidates that raise closeness ≥ min_closeness_gain<br/>and don't drop resolution below target"]
+    E --> O["Pre-filter 4: drop lone-small size outliers<br/>gbh < outlier_frac × cluster median"]
+    O --> SC["Score survivors (TOPSIS closeness over score + size)"]
+    SC --> GATE["SWAP RULE<br/>raise closeness ≥ min_closeness_gain,<br/>don't drop resolution below target,<br/>not bigger at a lower-or-equal score"]
     GATE --> LEFT{"any legal candidate?"}
     LEFT -->|no| HOLD["HOLD: mark satisfied"]
-    LEFT -->|yes| PICK["PICK best survivor<br/>topsis / max_score / min_size"]
+    LEFT -->|yes| PICK["PICK best survivor (topsis: max closeness)"]
     PICK --> ACT["ACT: POST grab {guid, indexerId}"]
 ```
 
@@ -176,14 +189,13 @@ default_preset = "Balanced"    # used when a profile name matches no preset keyw
 min_closeness_gain = 0.02      # global swap margin (per-preset overridable)
 
 [optimizer.topsis.presets.Efficient]
-score = 0.40                   # weights (sum 1.0)
-resolution = 0.10
-size = 0.50
+score = 0.44                   # weights (score + size, sum 1.0)
+size = 0.56
 pick = "topsis"                # topsis | max_score | min_size
 min_closeness_gain = 0.02      # optional per-preset override
 [optimizer.topsis.presets.Efficient.reference]
-"2160" = { floor = 3.5, target = 6.5, bloat = 14 }   # GiB/h per resolution
-"1080" = { floor = 1.0, target = 2.6, bloat = 7 }
+"2160" = { floor = 4.0, lo = 7.1, target = 7.8, hi = 8.8, ceiling = 15 }   # GiB/h per resolution
+"1080" = { floor = 1.5, lo = 2.8, target = 3.5, hi = 4.3, ceiling = 7.5 }
 # … 720 / 480 …
 ```
 
@@ -191,7 +203,7 @@ A Radarr/Sonarr profile attaches to the preset whose name is a case-insensitive 
 the profile name (`2160p Quality` → Quality). Pin or customize an exact profile with
 `[optimizer.topsis.profiles."<name>"]`, which may set `preset`, `weights`, `pick`, `reference`, or
 `min_closeness_gain` (anything omitted is inherited from the matched preset). Validation at load
-time enforces weights-sum-to-1, `0 ≤ min_closeness_gain < 1`, `floor < target ≤ bloat`, and a
+time enforces weights-sum-to-1, `0 ≤ min_closeness_gain < 1`, `floor < lo ≤ target ≤ hi < ceiling`, and a
 known `pick` method.
 
 ---

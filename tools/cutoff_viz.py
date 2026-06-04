@@ -139,9 +139,11 @@ def analyze(
         elif rid not in id_hard:
             status = f"drop: hard reject ({_hard_reject_reason(r)})"
         elif rid not in id_band:
-            floor, _t, bloat = topsis.reference_for(cand_res, resolved.reference)
+            floor, _lo, _t, _hi, ceiling = topsis.reference_for(cand_res, resolved.reference)
             g = attrs["raw"]["gbh"]
-            where = f"{g:.2f} < floor {floor:.2f}" if g < floor else f"{g:.2f} > bloat {bloat:.2f}"
+            where = (
+                f"{g:.2f} < floor {floor:.2f}" if g < floor else f"{g:.2f} > ceiling {ceiling:.2f}"
+            )
             status = f"drop: outside size band ({where})"
         elif rid not in id_gap:
             if (r.get("customFormatScore") or 0) < 0:

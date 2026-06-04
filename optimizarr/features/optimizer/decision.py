@@ -4,11 +4,13 @@
 (HOLD) — never merely "we triggered a grab". The decision is:
 
   1. **Prefilter + score** (topsis.py): drop hard rejections, drop outside the preset's size band
-     (floor..bloat), gap-cut the score tail, then score the survivors by TOPSIS closeness.
+     (floor..ceiling), gap-cut the score tail, drop lone-small outliers, then score the survivors
+     by TOPSIS closeness over two axes (score, size).
   2. **Swap rule** (here): a candidate is legal iff it raises closeness by at least the preset's
-     `min_closeness_gain` AND it does not drop resolution below the profile target. Because
-     closeness is computed from the release alone (not the current file), every accepted swap
-     strictly increases it, so the optimizer is provably non-oscillating.
+     `min_closeness_gain`, does not drop resolution below the profile target, AND is not "bigger at
+     a lower-or-equal score" (a larger file is grabbed only on a genuine score upgrade — the peaked
+     size curve no longer guarantees that for free). Because closeness is computed from the release
+     alone, every accepted swap strictly increases it, so the optimizer is provably non-oscillating.
   3. **Pick** (topsis.py): choose among the legal candidates by the profile's pick method.
 
 ACT iff at least one candidate is legal; otherwise HOLD (and the worker marks the item satisfied).
@@ -68,13 +70,17 @@ def decide(
     current_file: dict | None,
     allow_size_increase: bool = True,
     allow_quality_downgrade: bool = True,
+    allow_larger_at_lower_score: bool = False,
 ) -> Decision:
     """Pure decision: score the candidates, then keep those that raise closeness past the margin
     without dropping resolution below target, and pick the best survivor.
 
     Two optional pre-filters apply before scoring (per-app policy):
       - allow_size_increase=False drops releases bigger than the current file;
-      - allow_quality_downgrade=False drops releases with a lower customFormatScore."""
+      - allow_quality_downgrade=False drops releases with a lower customFormatScore.
+    allow_larger_at_lower_score=True drops the "never grow at a lower-or-equal score" swap guard,
+    letting the size bands realign even when the only nearer-the-band release scores lower (at the
+    cost of score regressions on bigger encodes)."""
     cur = current_file or {}
     cur_size = cur.get("size")
     if not allow_size_increase and isinstance(cur_size, int) and cur_size > 0:
@@ -94,6 +100,22 @@ def decide(
 
     legal: list[tuple[dict, dict, float]] = []
     for rel, attrs, clo in scored:
+        # Never grow a file without a score upgrade. Under the old one-sided size curve "no bigger
+        # file for a lower score" fell out for free; the peaked trapezoid can rank a bigger,
+        # nearer-the-band release above a too-small current file, so we restore the invariant
+        # explicitly: a larger file is accepted only on a genuine score upgrade. This stops the
+        # "too small smells bad" penalty from degrading into "drop the score to inflate the file".
+        cand_score = attrs["raw"]["score"]
+        if (
+            not allow_larger_at_lower_score
+            and cur_score is not None
+            and cand_score is not None
+            and cand_score <= cur_score
+            and isinstance(cur_size, int)
+            and cur_size > 0
+            and rel.get("size", 0) > cur_size
+        ):
+            continue
         if swap_allowed(
             current_closeness,
             clo,

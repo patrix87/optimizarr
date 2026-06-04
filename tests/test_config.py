@@ -186,15 +186,15 @@ def test_rejects_unknown_pick_method(monkeypatch, tmp_path):
         load_config(path)
 
 
-def test_rejects_reference_target_above_bloat(monkeypatch, tmp_path):
+def test_rejects_reference_out_of_order(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     path = _write(
         tmp_path,
         "[optimizer.topsis.presets.Balanced.reference]\n"
-        '"2160" = { floor = 3, target = 20, bloat = 18 }\n',
+        '"2160" = { floor = 3, lo = 5, target = 20, hi = 10, ceiling = 18 }\n',
     )
-    with pytest.raises(ValueError, match="floor < target <= bloat"):
+    with pytest.raises(ValueError, match="floor < lo <= target <= hi < ceiling"):
         load_config(path)
 
 
@@ -318,7 +318,7 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
         preset = "Remux"
 
         [optimizer.topsis.profiles."Custom 1080p"]
-        weights = { score = 0.5, resolution = 0.1, size = 0.4 }
+        weights = { score = 0.6, size = 0.4 }
         """,
     )
 
@@ -329,12 +329,12 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     assert t.score_gap == 0.30
     # shipped presets survive the deep-merge
     assert {"Remux", "Quality", "Balanced", "Efficient", "Compact"} <= set(t.presets)
-    assert t.presets["Compact"].weights["size"] == 0.70
-    assert t.presets["Compact"].pick == "min_size"
-    # per-preset absolute size tables (floor, target, bloat)
-    assert t.presets["Balanced"].reference[2160] == (4.5, 9.0, 16.0)
-    assert t.presets["Efficient"].reference[2160] == (3.5, 6.5, 14.0)
-    assert t.presets["Remux"].reference[2160] == (15.0, 35.0, 80.0)
+    assert t.presets["Compact"].weights["size"] == 0.78
+    assert t.presets["Compact"].pick == "topsis"
+    # per-preset 5-point size tables (floor, lo, target, hi, ceiling)
+    assert t.presets["Balanced"].reference[2160] == (5.0, 8.1, 9.3, 11.0, 20.0)
+    assert t.presets["Efficient"].reference[2160] == (4.0, 7.1, 7.8, 8.8, 15.0)
+    assert t.presets["Remux"].reference[2160] == (15.0, 28.0, 38.0, 60.0, 90.0)
     # swap margin default
     assert t.default_min_closeness_gain == 0.02
     assert t.presets["Balanced"].min_closeness_gain == 0.02

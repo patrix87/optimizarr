@@ -1,7 +1,7 @@
 """Weight lab: visualize how the presets score and pick releases under the new model.
 
-Drives the real engine: each preset's weights + absolute size table {floor, target, bloat} + pick,
-and the closeness-gain swap rule (via the real decide()). Two modes:
+Drives the real engine: each preset's weights + 5-point size table {floor, lo, target, hi,
+ceiling} + pick, and the closeness-gain swap rule (via the real decide()). Two modes:
 
   - default (synthetic): curated scenarios + a retention stress test, showing every candidate's
     closeness under every preset (★ = the preset's pick; "drop" = excluded by that preset's size
@@ -363,25 +363,26 @@ def main() -> None:
         "",
         f"Generated {datetime.now().isoformat(timespec='seconds')}",
         "",
-        "Each preset carries its own absolute size table {floor, target, bloat} GiB/h, weights,",
-        "and a pick method. A candidate is grabbed only if it raises closeness by at least",
-        "min_closeness_gain (and does not drop resolution below target). ★ = the preset's pick;",
-        "'drop' = excluded by that preset's size band (floor..bloat) or the score gap-cut.",
+        "Each preset carries its own 5-point size table {floor, lo, target, hi, ceiling} GiB/h,",
+        "weights (score + size), and a pick method. A candidate is grabbed only if it raises",
+        "closeness by at least min_closeness_gain (and does not drop resolution below target, and",
+        "is not bigger at a lower-or-equal score). ★ = the preset's pick; 'drop' = excluded by",
+        "that preset's size band (floor..ceiling) or the score gap-cut.",
         "",
         "## Presets",
         "",
-        "| preset | score | res | size | pick | gain | 2160 (floor/target/bloat) | 1080 | 720 |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| preset | score | size | pick | gain | 2160 (floor/lo/target/hi/ceiling) | 1080 | 720 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
 
     def _band(p, res: int) -> str:
-        f, tgt, b = p.reference.get(res, ("-", "-", "-"))
-        return f"{f:g}/{tgt:g}/{b:g}" if f != "-" else "-"
+        pts = p.reference.get(res)
+        return "/".join(f"{v:g}" for v in pts) if pts else "-"
 
     for name, p in t.cfg.presets.items():
         w = p.weights
         md.append(
-            f"| {name} | {w['score']:.2f} | {w['resolution']:.2f} | {w['size']:.2f} | "
+            f"| {name} | {w['score']:.2f} | {w['size']:.2f} | "
             f"{p.pick} | {p.min_closeness_gain:g} | {_band(p, 2160)} | {_band(p, 1080)} | "
             f"{_band(p, 720)} |"
         )

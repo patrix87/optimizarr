@@ -4,17 +4,19 @@ Tuning values (per-preset size tables, score anchors) come from the merged confi
 (defaults.toml + the user's config.toml) — there are no magic defaults baked into this module.
 The shared loader (optimizarr.config) delegates to parse_optimizer() here.
 
-Size model: each preset carries its OWN absolute `reference` table, one `{floor, target, bloat}`
-entry per resolution, in GiB/h:
-  - floor : below this the encode is illegitimate for the resolution (upscale / mislabeled /
-            too soft) -> hard pre-filter drop.
-  - target: where the TOPSIS size score plateaus (n_size = 1.0 at/below target).
-  - bloat : above this is bloat -> hard pre-filter drop (and n_size = 0 at bloat).
+Size model: each preset carries its OWN absolute `reference` table, one 5-point trapezoid
+`{floor, lo, target, hi, ceiling}` entry per resolution, in GiB/h:
+  - floor / ceiling : legitimacy bounds. Outside [floor, ceiling] a release is dropped before
+                      scoring (too small / fake below floor, bloated above ceiling), n_size = 0.
+  - lo .. hi        : the "good size" band; n_size = `size_shoulder` at lo/hi, so inside it score
+                      drives the pick and `target` placement only nudges the preference.
+  - target          : the peak (n_size = 1.0), placed at a per-profile percentile of real sizes.
 
+Scoring is TWO axes (score, size); resolution is a hard guard in decision.py, not a weighted axis.
 The swap rule is a single closeness-gain test (see decision.py): a candidate is taken only if it
-raises TOPSIS closeness by at least `min_closeness_gain`, plus a resolution guard. That makes the
-optimizer provably non-oscillating (closeness is file-independent and strictly increases), so the
-old relative size/score "much/slightly" transition matrix is gone.
+raises TOPSIS closeness by at least `min_closeness_gain`, plus the resolution guard. Closeness is a
+fixed function of the release alone, so the optimizer is provably non-oscillating (every swap
+strictly increases it).
 """
 
 from __future__ import annotations
@@ -36,17 +38,19 @@ PICK_ORDERS = {
 }
 PICK_METHODS = {"topsis", "max_score", "min_size"}
 
-# resolution -> (floor, target, bloat) GiB/h.
-Reference = dict[int, tuple[float, float, float]]
+# resolution -> (floor, lo, target, hi, ceiling) GiB/h. A 5-point trapezoid: n_size is 0 outside
+# [floor, ceiling], rises to `shoulder` at lo, peaks at 1.0 at target, falls back to `shoulder` at
+# hi. The flat-ish [lo, hi] band is the "good size" region where score drives the pick.
+Reference = dict[int, tuple[float, float, float, float, float]]
 
 
 @dataclass
 class Preset:
     """A named bundle: TOPSIS weights + a pick method + an absolute size table + swap margin."""
 
-    weights: dict[str, float]  # keys: score, resolution, size (sum 1.0)
+    weights: dict[str, float]  # keys: score, size (sum 1.0)
     pick: str  # "topsis" | "max_score" | "min_size"
-    reference: Reference  # res -> (floor, target, bloat) GiB/h
+    reference: Reference  # res -> (floor, lo, target, hi, ceiling) GiB/h
     min_closeness_gain: float  # swap only if closeness improves by at least this
 
 
@@ -75,12 +79,23 @@ class ResolvedProfile:
 class TopsisConfig:
     score_ideal: int
     score_anti_ideal: int
-    resolution_ideal: int
-    resolution_anti_ideal: int
     score_gap: float
     default_preset: str
     default_min_closeness_gain: float
     presets: dict[str, Preset]
+    # Score-axis normalization. "logistic" (default) maps raw score through an S-curve centered
+    # at score_center with slope set by score_width, concentrating the [0,1] range where releases
+    # actually cluster. "linear" uses the fixed score_anti_ideal..score_ideal ramp.
+    score_norm: str = "logistic"
+    score_center: float = 825000.0
+    score_width: float = 87500.0
+    # n_size value at the band shoulders (lo/hi). Higher = flatter band = score drives harder
+    # inside it. 1.0 collapses the trapezoid to a hard top-hat.
+    size_shoulder: float = 0.85
+    # Outlier prefilter: drop a candidate whose GiB/h is below outlier_frac x the median GiB/h of
+    # the comparable-score (gap-cut) cluster. Encodes "a good release has corroborating peers";
+    # 0 disables it.
+    outlier_frac: float = 0.5
     profiles: dict[str, ProfileOverride] = field(default_factory=dict)
 
 
@@ -119,8 +134,8 @@ class OptimizerConfig:
 
 
 def _weights(raw: dict, where: str) -> dict[str, float]:
-    w = {k: float(raw[k]) for k in ("score", "resolution", "size") if k in raw}
-    missing = {"score", "resolution", "size"} - w.keys()
+    w = {k: float(raw[k]) for k in ("score", "size") if k in raw}
+    missing = {"score", "size"} - w.keys()
     if missing:
         raise ValueError(f"{where}: missing weight keys {sorted(missing)}")
     total = sum(w.values())
@@ -136,17 +151,22 @@ def _reference(raw: dict, where: str) -> Reference:
             res_int = int(res)
         except (TypeError, ValueError) as e:
             raise ValueError(f"{where}: key {res!r} is not an integer resolution") from e
-        if not isinstance(entry, dict) or not {"floor", "target", "bloat"} <= entry.keys():
-            raise ValueError(f"{where}.{res}: expected {{floor, target, bloat}}, got {entry!r}")
-        floor = float(entry["floor"])
-        target = float(entry["target"])
-        bloat = float(entry["bloat"])
-        if not (floor < target <= bloat):
+        need = {"floor", "lo", "target", "hi", "ceiling"}
+        if not isinstance(entry, dict) or not need <= entry.keys():
             raise ValueError(
-                f"{where}.{res}: must satisfy floor < target <= bloat, "
-                f"got floor={floor} target={target} bloat={bloat}"
+                f"{where}.{res}: expected {{floor, lo, target, hi, ceiling}}, got {entry!r}"
             )
-        out[res_int] = (floor, target, bloat)
+        floor = float(entry["floor"])
+        lo = float(entry["lo"])
+        target = float(entry["target"])
+        hi = float(entry["hi"])
+        ceiling = float(entry["ceiling"])
+        if not (floor < lo <= target <= hi < ceiling):
+            raise ValueError(
+                f"{where}.{res}: must satisfy floor < lo <= target <= hi < ceiling, "
+                f"got floor={floor} lo={lo} target={target} hi={hi} ceiling={ceiling}"
+            )
+        out[res_int] = (floor, lo, target, hi, ceiling)
     if not out:
         raise ValueError(f"{where} is empty (a preset must define its size table)")
     return out
@@ -216,15 +236,32 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
     for name, ov in profiles.items():
         if ov.preset is not None and ov.preset not in presets:
             raise ValueError(f"profiles.{name}.preset {ov.preset!r} is not a defined preset")
+    score_norm = str(raw.get("score_norm", "logistic"))
+    if score_norm not in {"logistic", "linear"}:
+        raise ValueError(
+            f"optimizer.topsis.score_norm must be 'logistic' or 'linear', got {score_norm!r}"
+        )
+    score_width = float(raw.get("score_width", 85000))
+    if score_width <= 0:
+        raise ValueError(f"optimizer.topsis.score_width must be > 0, got {score_width}")
+    size_shoulder = float(raw.get("size_shoulder", 0.85))
+    if not (0.0 <= size_shoulder <= 1.0):
+        raise ValueError(f"optimizer.topsis.size_shoulder must be in [0, 1], got {size_shoulder}")
+    outlier_frac = float(raw.get("outlier_frac", 0.5))
+    if not (0.0 <= outlier_frac < 1.0):
+        raise ValueError(f"optimizer.topsis.outlier_frac must be in [0, 1), got {outlier_frac}")
     return TopsisConfig(
         score_ideal=int(raw["score_ideal"]),
         score_anti_ideal=int(raw["score_anti_ideal"]),
-        resolution_ideal=int(raw["resolution_ideal"]),
-        resolution_anti_ideal=int(raw["resolution_anti_ideal"]),
         score_gap=float(raw["score_gap"]),
         default_preset=default_preset,
         default_min_closeness_gain=default_min_gain,
         presets=presets,
+        score_norm=score_norm,
+        score_center=float(raw.get("score_center", 805000)),
+        score_width=score_width,
+        size_shoulder=size_shoulder,
+        outlier_frac=outlier_frac,
         profiles=profiles,
     )
 
