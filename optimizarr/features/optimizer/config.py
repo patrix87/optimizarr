@@ -8,13 +8,14 @@ obviously-bad (score < 0, score below `current - score_window`, wrong resolution
 shared per-resolution `size_bounds` legitimacy band, lone-small outliers). The survivors are then
 scored on TWO axes, each min-max normalized OVER THE SURVIVORS (+ the current file): score (higher
 better) and GiB/h (smaller better). A profile's `weights` combine them into a TOPSIS closeness.
-The only per-profile knob is the weights. Oscillation is prevented by one-and-done state (a movie
-is satisfied once its current file is optimal and never re-evaluated), not by a closeness margin.
+The only per-profile knob is the weights. A grab is issued only when the pick clears at least one
+of the two concrete improvement thresholds (min_score_delta or min_size_delta_gb).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import time
 
 from optimizarr.config import RADARR_RELEASE_TYPES, SONARR_RELEASE_TYPES
 
@@ -36,19 +37,17 @@ SizeBounds = dict[int, tuple[float, float]]
 
 @dataclass
 class Preset:
-    """A named bundle: TOPSIS weights + a swap margin. The pick is always max closeness."""
+    """A named bundle: TOPSIS weights. The pick is always max closeness."""
 
     weights: dict[str, float]  # keys: score, size (sum 1.0)
-    min_closeness_gain: float  # ACT only if the pick beats the current file's closeness by this
 
 
 @dataclass
 class ProfileOverride:
-    """Exact-name override: reference a preset, or override its weights / margin."""
+    """Exact-name override: reference a preset, or override its weights."""
 
     preset: str | None = None
     weights: dict[str, float] | None = None
-    min_closeness_gain: float | None = None
 
 
 @dataclass
@@ -56,13 +55,11 @@ class ResolvedProfile:
     """Everything the scorer + decision need for one profile, after preset + override."""
 
     weights: dict[str, float]
-    min_closeness_gain: float
 
 
 @dataclass
 class TopsisConfig:
     default_preset: str
-    default_min_closeness_gain: float
     presets: dict[str, Preset]
     # Three-tier score window (see topsis._score_floor_tier):
     #   Tier 1: keep score >= max_available - score_window (anchor at top of what's on offer).
@@ -72,7 +69,14 @@ class TopsisConfig:
     # Minimum pool size used at two gates: (1) the score-window tier check (expand to the next
     # tier if too few survive the current one); (2) the TOPSIS gate (HOLD without satisfying if
     # fewer than this many remain after all filters -- relative min-max is untrustworthy too thin).
-    min_candidates: int = 6
+    min_candidates: int = 2
+    # ACT gate: both conditions must hold.
+    #   1. Axis gate: at least one axis must move a meaningful amount vs the current file.
+    min_score_delta: int = 100
+    min_size_delta_gb: float = 0.5
+    #   2. Closeness gate: the pick's TOPSIS closeness must also improve by at least this.
+    #      Prevents grabbing when an axis moved just enough but the overall balance did not improve.
+    min_closeness_gain: float = 0.02
     # Outlier prefilter: drop a candidate whose GiB/h is below outlier_frac x the median GiB/h of
     # the surviving cluster. 0 disables it.
     outlier_frac: float = 0.5
@@ -98,6 +102,14 @@ class OptimizerAppConfig:
 
 
 @dataclass
+class ScheduleWindow:
+    """One day's active window in local time. start >= end means the window crosses midnight."""
+
+    start: time
+    end: time
+
+
+@dataclass
 class OptimizerConfig:
     enabled: bool = False
     queue_max: int = 5
@@ -108,6 +120,10 @@ class OptimizerConfig:
     radarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     sonarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     topsis: TopsisConfig = field(default_factory=lambda: default_topsis())
+    # Per-day active-hours schedule (weekday int -> window, 0=Monday 6=Sunday).
+    # Empty dict means always active. Evaluation and list refresh are skipped outside the window;
+    # queue import processing always continues.
+    schedule: dict[int, ScheduleWindow] = field(default_factory=dict)
 
 
 # ----- parsing helpers -----
@@ -146,36 +162,17 @@ def _size_bounds(raw: dict, where: str) -> SizeBounds:
     return out
 
 
-def _parse_min_gain(value: float | int, where: str) -> float:
-    gain = float(value)
-    if not (0.0 <= gain < 1.0):
-        raise ValueError(f"{where}.min_closeness_gain must satisfy 0 <= gain < 1.0, got {gain}")
-    return gain
-
-
-def _parse_preset(raw: dict, where: str, default_min_gain: float) -> Preset:
-    min_gain = (
-        _parse_min_gain(raw["min_closeness_gain"], where)
-        if "min_closeness_gain" in raw
-        else default_min_gain
-    )
-    return Preset(weights=_weights(raw, where), min_closeness_gain=min_gain)
+def _parse_preset(raw: dict, where: str) -> Preset:
+    return Preset(weights=_weights(raw, where))
 
 
 def _parse_profile_override(raw: dict, where: str) -> ProfileOverride:
     weights = _weights(raw["weights"], f"{where}.weights") if "weights" in raw else None
-    min_gain = (
-        _parse_min_gain(raw["min_closeness_gain"], where) if "min_closeness_gain" in raw else None
-    )
-    return ProfileOverride(preset=raw.get("preset"), weights=weights, min_closeness_gain=min_gain)
+    return ProfileOverride(preset=raw.get("preset"), weights=weights)
 
 
 def _parse_topsis(raw: dict) -> TopsisConfig:
-    default_min_gain = _parse_min_gain(raw["min_closeness_gain"], "optimizer.topsis")
-    presets = {
-        name: _parse_preset(p, f"presets.{name}", default_min_gain)
-        for name, p in raw["presets"].items()
-    }
+    presets = {name: _parse_preset(p, f"presets.{name}") for name, p in raw["presets"].items()}
     if not presets:
         raise ValueError("optimizer.topsis.presets is empty (defaults.toml should define them)")
     default_preset = str(raw["default_preset"])
@@ -194,6 +191,19 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
     min_candidates = int(raw["min_candidates"])
     if min_candidates < 1:
         raise ValueError(f"optimizer.topsis.min_candidates must be >= 1, got {min_candidates}")
+    min_score_delta = int(raw["min_score_delta"])
+    if min_score_delta < 0:
+        raise ValueError(f"optimizer.topsis.min_score_delta must be >= 0, got {min_score_delta}")
+    min_size_delta_gb = float(raw["min_size_delta_gb"])
+    if min_size_delta_gb < 0:
+        raise ValueError(
+            f"optimizer.topsis.min_size_delta_gb must be >= 0, got {min_size_delta_gb}"
+        )
+    min_closeness_gain = float(raw["min_closeness_gain"])
+    if not (0.0 <= min_closeness_gain < 1.0):
+        raise ValueError(
+            f"optimizer.topsis.min_closeness_gain must be in [0, 1), got {min_closeness_gain}"
+        )
     outlier_frac = float(raw["outlier_frac"])
     if not (0.0 <= outlier_frac < 1.0):
         raise ValueError(f"optimizer.topsis.outlier_frac must be in [0, 1), got {outlier_frac}")
@@ -203,10 +213,12 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
         )
     return TopsisConfig(
         default_preset=default_preset,
-        default_min_closeness_gain=default_min_gain,
         presets=presets,
         score_window=score_window,
         min_candidates=min_candidates,
+        min_score_delta=min_score_delta,
+        min_size_delta_gb=min_size_delta_gb,
+        min_closeness_gain=min_closeness_gain,
         outlier_frac=outlier_frac,
         size_bounds=_size_bounds(raw["size_bounds"], "optimizer.topsis.size_bounds"),
         profiles=profiles,
@@ -242,6 +254,42 @@ def _parse_optimizer_app(raw: dict, allowed: set[str], where: str) -> OptimizerA
     )
 
 
+_DAY_TO_WEEKDAY: dict[str, int] = {
+    "sunday": 6,
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+}
+
+
+def _parse_time(s: str, where: str) -> time:
+    try:
+        h, m = str(s).strip().split(":")
+        return time(int(h), int(m))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"{where}: invalid time {s!r}, expected HH:MM") from exc
+
+
+def _parse_schedule(raw: dict, where: str) -> dict[int, ScheduleWindow]:
+    out: dict[int, ScheduleWindow] = {}
+    for day, entry in raw.items():
+        wd = _DAY_TO_WEEKDAY.get(str(day).lower())
+        if wd is None:
+            raise ValueError(
+                f"{where}: unknown day {day!r}; expected one of {sorted(_DAY_TO_WEEKDAY)}"
+            )
+        if not isinstance(entry, dict) or "start" not in entry or "end" not in entry:
+            raise ValueError(f"{where}.{day}: expected {{start = ..., end = ...}}, got {entry!r}")
+        out[wd] = ScheduleWindow(
+            start=_parse_time(entry["start"], f"{where}.{day}.start"),
+            end=_parse_time(entry["end"], f"{where}.{day}.end"),
+        )
+    return out
+
+
 def parse_optimizer(raw: dict) -> OptimizerConfig:
     pick_order = str(raw["pick_order"]).strip()
     if pick_order not in PICK_ORDERS:
@@ -263,6 +311,7 @@ def parse_optimizer(raw: dict) -> OptimizerConfig:
         radarr=_parse_optimizer_app(raw["radarr"], RADARR_RELEASE_TYPES, "optimizer.radarr"),
         sonarr=_parse_optimizer_app(raw["sonarr"], SONARR_RELEASE_TYPES, "optimizer.sonarr"),
         topsis=_parse_topsis(raw["topsis"]),
+        schedule=_parse_schedule(raw.get("schedule", {}), "optimizer.schedule"),
     )
 
 

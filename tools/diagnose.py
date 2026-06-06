@@ -82,10 +82,16 @@ def _candidate_status(
 
 
 def _candidates(
-    r: dict, t: Topsis, cur_score, target_res: int, pick_title: str | None
+    r: dict,
+    t: Topsis,
+    cur_score,
+    target_res: int,
+    pick_title: str | None,
+    clo_map: dict[str, float],
 ) -> list[dict]:
-    """In-window candidates for one movie, each annotated with status. Uses the same three-tier
-    score floor as the engine so the drill-down exactly mirrors what got filtered."""
+    """In-window candidates for one movie, each annotated with status and closeness.
+    Uses the same three-tier score floor as the engine so the drill-down exactly mirrors
+    what got filtered. Closeness is None for candidates filtered out before scoring."""
     elig_scores = [
         x.get("score") or 0
         for x in r["releases"]
@@ -103,14 +109,16 @@ def _candidates(
         st = _candidate_status(x, t, floor_score, target_res, pick_title)
         if st in ("rejected", "neg-score", "below-window"):
             continue
+        title = x.get("title") or "?"
         out.append(
             {
-                "title": x.get("title") or "?",
+                "title": title,
                 "score": x.get("score") or 0,
                 "res": x.get("resolution") or 0,
                 "gbh": x.get("gbh") or 0.0,
                 "size_gb": x.get("size_gb") or 0.0,
                 "status": st,
+                "closeness": clo_map.get(title),  # None when filtered before scoring
             }
         )
     out.sort(key=lambda c: (-c["score"], c["gbh"]))
@@ -124,14 +132,26 @@ def _evaluate(rows: list[dict], t: Topsis) -> list[dict]:
         cur = _cur(cf)
         profile = r["profile"]["name"]
         target_res = r["profile"]["target_resolution"] or (cf or {}).get("resolution") or 0
+        releases = [_cand(x) for x in r["releases"]]
         d = decide(
             t,
-            [_cand(x) for x in r["releases"]],
+            releases,
             r["runtime_h"],
             profile,
             target_res,
             current_file=cur,
         )
+
+        # Run a scoring pass to get per-candidate closeness for the drill-down table.
+        cur_score = (cf or {}).get("score")
+        resolved = t.resolve_profile(profile)
+        kept, _ = t.apply_prefilters(releases, r["runtime_h"], int(target_res or 0), cur_score)
+        clo_map: dict[str, float] = {}
+        if kept:
+            scored_pool, _ = t.score_pool(kept, cur, r["runtime_h"], resolved)
+            clo_map = {rel.get("title", "?"): clo for rel, _, clo in scored_pool}
+
+        cur_clo = d.current.get("closeness") if d.current else None
         rec = {
             "title": r["title"],
             "profile": profile,
@@ -139,15 +159,20 @@ def _evaluate(rows: list[dict], t: Topsis) -> list[dict]:
             "satisfy": d.satisfy,
             "reason": d.reason,
             "cur": cf or {},
+            "cur_clo": cur_clo,
             "pick": d.pick if d.action == "ACT" else None,
         }
         pick_title = d.pick.get("title") if d.action == "ACT" and d.pick else None
-        rec["cands"] = _candidates(r, t, (cf or {}).get("score"), int(target_res or 0), pick_title)
+        rec["cands"] = _candidates(r, t, cur_score, int(target_res or 0), pick_title, clo_map)
         if rec["pick"] and cf:
             pk = rec["pick"]
             rec["dscore"] = (pk.get("score") or 0) - (cf.get("score") or 0)
             rec["dsize"] = (pk.get("size_gb") or 0) - (cf.get("size_gb") or 0)
             rec["dgbh"] = (pk.get("gbh") or 0) - (cf.get("gbh") or 0)
+            pick_clo = pk.get("closeness")
+            rec["dclo"] = (
+                (pick_clo - cur_clo) if (pick_clo is not None and cur_clo is not None) else None
+            )
             rec["quad"] = _quadrant(rec["dscore"], rec["dsize"])
         records.append(rec)
     return records
@@ -198,18 +223,20 @@ def _write_md(records: list[dict], s: dict, out: Path) -> None:
     L.append("\n## Original file -> new pick (ACT only)\n")
     L.append(
         "| movie | profile | quadrant | current (score / GB / gb·h) | "
-        "new pick (score / GB / gb·h) | Δscore | Δsize | Δgb·h |"
+        "new pick (score / GB / gb·h) | Δscore | Δsize | Δgb·h | Δclo |"
     )
-    L.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: |")
+    L.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |")
     for r in records:
         if r["action"] != "ACT":
             continue
         cf, pk = r["cur"], r["pick"]
+        dclo = r.get("dclo")
+        dclo_s = f"{dclo:+.3f}" if dclo is not None else "-"
         L.append(
             f"| {r['title']} | {r['profile']} | {r['quad']} | "
             f"{cf.get('score', 0):,} / {cf.get('size_gb', 0):.1f} / {cf.get('gbh', 0):.2f} | "
             f"{pk.get('score', 0):,} / {pk.get('size_gb', 0):.1f} / {pk.get('gbh', 0):.2f} | "
-            f"{r['dscore']:+,} | {r['dsize']:+.1f}GB | {r['dgbh']:+.2f} |"
+            f"{r['dscore']:+,} | {r['dsize']:+.1f}GB | {r['dgbh']:+.2f} | {dclo_s} |"
         )
     out.write_text("\n".join(L) + "\n")
 
@@ -300,6 +327,12 @@ def _tbl(tid: str, cols: list[tuple[str, bool]], rows: list[list[str]], filt: bo
     )
 
 
+def _clo_cell(v: float | None, cls: str = "num") -> str:
+    if v is None:
+        return _cell("-", -999, cls)
+    return _cell(f"{v:.3f}", v, cls)
+
+
 def _write_html(records: list[dict], s: dict, out: Path) -> None:
     cards = (
         f"<div class=cards>"
@@ -331,18 +364,24 @@ def _write_html(records: list[dict], s: dict, out: Path) -> None:
         ("Cur score", True),
         ("Cur GB", True),
         ("Cur gb/h", True),
+        ("Cur clo", True),
         ("Pick score", True),
         ("Pick GB", True),
         ("Pick gb/h", True),
+        ("Pick clo", True),
         ("Δscore", True),
         ("Δsize GB", True),
         ("Δgb/h", True),
+        ("Δclo", True),
     ]
     prows = []
     for r in records:
         if r["action"] != "ACT":
             continue
         cf, pk = r["cur"], r["pick"]
+        cur_clo = r.get("cur_clo")
+        pick_clo = pk.get("closeness") if pk else None
+        dclo = r.get("dclo")
         prows.append(
             [
                 _cell(r["title"], cls="txt link"),
@@ -351,12 +390,19 @@ def _write_html(records: list[dict], s: dict, out: Path) -> None:
                 _cell(f"{cf.get('score', 0):,}", cf.get("score") or 0, "num"),
                 _cell(f"{cf.get('size_gb', 0):.1f}", cf.get("size_gb") or 0, "num"),
                 _cell(f"{cf.get('gbh', 0):.2f}", cf.get("gbh") or 0, "num"),
+                _clo_cell(cur_clo),
                 _cell(f"{pk.get('score', 0):,}", pk.get("score") or 0, "num"),
                 _cell(f"{pk.get('size_gb', 0):.1f}", pk.get("size_gb") or 0, "num"),
                 _cell(f"{pk.get('gbh', 0):.2f}", pk.get("gbh") or 0, "num"),
+                _clo_cell(pick_clo),
                 _cell(f"{r['dscore']:+,}", r["dscore"], "num"),
                 _cell(f"{r['dsize']:+.1f}", r["dsize"], "num"),
                 _cell(f"{r['dgbh']:+.2f}", r["dgbh"], "num"),
+                _cell(
+                    f"{dclo:+.3f}" if dclo is not None else "-",
+                    dclo if dclo is not None else -999,
+                    "num",
+                ),
             ]
         )
     picks = "<div class=sub>Click a movie title to see all its in-window candidates.</div>" + _tbl(
@@ -372,6 +418,7 @@ def _write_html(records: list[dict], s: dict, out: Path) -> None:
         ("Res", True),
         ("gb/h", True),
         ("GB", True),
+        ("Closeness", True),
     ]
     crows = []
     for r in records:
@@ -385,11 +432,13 @@ def _write_html(records: list[dict], s: dict, out: Path) -> None:
                     _cell(f"{c['res']}p", c["res"], "num"),
                     _cell(f"{c['gbh']:.2f}", c["gbh"], "num"),
                     _cell(f"{c['size_gb']:.1f}", c["size_gb"], "num"),
+                    _clo_cell(c.get("closeness")),
                 ]
             )
     cands_tab = (
         "<div class=sub>In-window candidates (score within the downgrade budget). "
-        "<b>PICK</b> = chosen; wrong-res / below-floor / above-ceiling = filtered out.</div>"
+        "<b>PICK</b> = chosen; wrong-res / below-floor / above-ceiling = filtered out. "
+        "Closeness is relative to the surviving pool (blank when filtered before scoring).</div>"
         + _tbl("c-tbl", ccols, crows)
     )
 

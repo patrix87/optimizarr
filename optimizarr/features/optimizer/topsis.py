@@ -115,7 +115,7 @@ class Topsis:
         return self.cfg.default_preset
 
     def resolve_profile(self, profile_name: str | None) -> ResolvedProfile:
-        """Resolve a profile name to weights + pick + margin, honoring an exact-name override,
+        """Resolve a profile name to weights, honoring an exact-name override,
         then name-keyword preset matching, then default_preset."""
         cfg = self.cfg
         override = cfg.profiles.get(profile_name) if profile_name else None
@@ -126,12 +126,7 @@ class Topsis:
         else:
             base = cfg.presets[cfg.default_preset]
         weights = override.weights if (override and override.weights) else base.weights
-        min_gain = (
-            override.min_closeness_gain
-            if (override and override.min_closeness_gain is not None)
-            else base.min_closeness_gain
-        )
-        return ResolvedProfile(weights=weights, min_closeness_gain=min_gain)
+        return ResolvedProfile(weights=weights)
 
     def bounds_for(self, res: int) -> tuple[float, float]:
         """(floor, ceiling) GiB/h for a resolution; nearest defined at or below, else lowest."""

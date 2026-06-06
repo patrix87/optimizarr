@@ -74,6 +74,7 @@ def test_score_window_tier1_tight_pool():
 
 def test_score_window_tier2_expands_to_current():
     t = _topsis()
+    t.cfg.min_candidates = 6  # tier-expansion tests need a pool threshold above 3
     # Only 3 releases above the Tier-1 floor (900k); 6 more clustered just below current (880k).
     top = [_release(score=s) for s in [1_000_000, 990_000, 980_000]]
     mid = [_release(score=880_000 + i * 1_000) for i in range(6)]  # 880k-885k
@@ -86,6 +87,7 @@ def test_score_window_tier2_expands_to_current():
 def test_score_window_tier3_fallback_and_negatives():
     # With too few candidates at every tier, Tier 3 fires (full budget).
     t = _topsis()
+    t.cfg.min_candidates = 6  # tier-expansion tests need a pool threshold above 3
     rels = [
         _release(score=1_000_000),
         _release(score=905_000),

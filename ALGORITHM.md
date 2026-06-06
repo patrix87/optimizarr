@@ -17,13 +17,12 @@ Three ideas carry the whole design:
   profile shrink a movie that another leaves alone.
 - **The forbidden quadrant.** Versus the current file a pick may be better+bigger (a real score
   upgrade), better+smaller (ideal), or a little worse+smaller (a deliberate size trade). It may
-  **never** be worse *and* bigger. That falls out for free: a candidate worse on both axes has a
-  lower TOPSIS closeness than the current file, and the optimizer only ACTs when a candidate beats
-  the current file.
+  **never** be worse *and* bigger. That falls out for free: a candidate worse on both axes must
+  improve by at least one concrete threshold (`min_score_delta` or `min_size_delta_gb`) to ACT,
+  which a worse+bigger candidate never can.
 - **One-and-done.** A movie is optimized once: when its current (imported) file is the best pick
-  for its profile it is marked *satisfied* and never re-evaluated. This is what makes relative
-  scoring safe — there is no re-evaluation loop to oscillate — and it removes the need for any
-  closeness-margin oscillation proof.
+  for its profile it is marked *satisfied* and never re-evaluated. This removes re-evaluation loops
+  that could oscillate.
 
 ---
 
@@ -99,19 +98,19 @@ into the score, and filter 3 already pins it).
 `decision.py::decide`: resolve the profile → run the filters → relatively score the survivors →
 compare to the current file.
 
-- ACT on the best candidate (by the profile's `pick` method, default `topsis` = highest closeness)
-  **iff** its closeness beats the current file's by `min_closeness_gain` (default `0.02`, a small
-  hysteresis). Two optional per-app pre-filters run first: `allow_size_increase = false` drops
-  anything bigger than the current file, `allow_quality_downgrade = false` drops anything
+- ACT on the best candidate (highest TOPSIS closeness) **iff** it clears at least one concrete
+  threshold vs the current file: score improves by `>= min_score_delta` (default `100`) **or**
+  size shrinks by `>= min_size_delta_gb` (default `0.5 GB`). When there is no current file, any
+  candidate qualifies. Two optional per-app pre-filters run first: `allow_size_increase = false`
+  drops anything bigger than the current file, `allow_quality_downgrade = false` drops anything
   lower-scoring.
 - Otherwise **HOLD**. Two kinds:
-  - **satisfiable** — there were enough candidates and none beat the current file: it is already
-    optimal for its profile, so mark it satisfied (permanent).
+  - **satisfiable** — there were enough candidates and none cleared either threshold: the current
+    file is good enough for its profile, so mark it satisfied (permanent).
   - **insufficient** — fewer than `min_candidates`: do *not* satisfy; retry later.
 
-The forbidden quadrant is impossible: a candidate that is both lower-score and bigger than the
-current file is worse on both axes, so its closeness ≤ the current file's, so it never clears the
-ACT margin.
+The forbidden quadrant is impossible: a candidate worse on both axes (lower score, bigger size)
+cannot clear either threshold and therefore never triggers ACT.
 
 ---
 
@@ -125,22 +124,22 @@ score_window = 100000          # downgrade budget: keep score >= current - this
 min_candidates = 2             # below this, HOLD without satisfying
 outlier_frac = 0.5             # drop releases below 0.5x the movie's median GiB/h (junk guard)
 default_preset = "Balanced"    # used when a profile name matches no preset keyword
-min_closeness_gain = 0.02      # ACT margin over the current file (per-preset overridable)
+min_score_delta = 100          # ACT only if pick.score - current.score >= this
+min_size_delta_gb = 0.5        # ...or if current.size - pick.size >= this (in GB)
 
 [optimizer.topsis.size_bounds]  # shared per-resolution {floor, ceiling} GiB/h legitimacy band
-"2160" = { floor = 1.5,  ceiling = 36.1 }
-"1080" = { floor = 0.45, ceiling = 13.3 }
+"2160" = { floor = 3.0, ceiling = 30.0 }
+"1080" = { floor = 1.0, ceiling = 15.0 }
 # … 720 / 480 …
 
 [optimizer.topsis.presets.Efficient]
-score = 0.44                   # weights (score + size, sum 1.0) — the only per-profile knob
-size = 0.56
-pick = "topsis"                # topsis | max_score | min_size
+score = 0.40                   # weights (score + size, sum 1.0) — the only per-profile knob
+size = 0.60
 ```
 
 A profile attaches to the preset whose name is a case-insensitive substring of the profile name
-(`2160p Efficient` → Efficient); `[optimizer.topsis.profiles."Exact Name"]` overrides a preset,
-weights, pick, or margin for one profile.
+(`2160p Efficient` → Efficient); `[optimizer.topsis.profiles."Exact Name"]` overrides a preset
+or its weights for one profile.
 
 ---
 
@@ -176,6 +175,17 @@ stateDiagram-v2
 - Satisfied is **permanent**: there is no time-based re-evaluation. A satisfied movie becomes
   eligible again only if its **profile changes** (the optimal pick depends on the profile) or its
   **file is removed**. To force a full re-run, delete (or edit) `state.json`.
+
+### Active-hours schedule
+
+`[optimizer.schedule]` defines a per-day active window in local time (24h HH:MM). **Outside the
+window the worker skips list refresh and movie evaluation, but queue import processing always
+runs** (so completed downloads kept off the queue by auto-import are never blocked by the
+schedule).
+
+A window where `start >= end` crosses midnight. The default ships `23:00` to `08:00` on every day,
+meaning the optimizer queries indexers and evaluates movies overnight. Omit a day (or the entire
+block) to treat that day as always active. Transitions are logged once at INFO.
 
 ---
 

@@ -8,13 +8,15 @@ HOLD that *satisfies*), never merely "we triggered a grab". The decision is:
      drop lone-small outliers, then min-max normalize the survivors on two relative axes (score,
      GiB/h) and combine with the profile's weights into a TOPSIS closeness.
   2. **Decide** (here): if too few candidates survived to compare, HOLD WITHOUT satisfying (retry
-     later). Otherwise ACT on the best candidate iff its closeness beats the current file's by the
-     margin; else HOLD and SATISFY (the current file is already optimal for its profile).
+     later). Otherwise ACT on the best candidate iff it clears BOTH gate sets vs the current file:
+     axis gate (score improves >= min_score_delta OR size shrinks >= min_size_delta_gb) AND
+     closeness gate (TOPSIS closeness improves >= min_closeness_gain). Both must pass.
+     If no candidate clears both, HOLD and SATISFY (the current file is already good enough).
 
-A satisfying HOLD means the current (already-imported) file is the best pick. Because a candidate
-must beat the current file's closeness, a pick can never be both lower-score AND bigger than the
-current file (that is worse on both axes, so lower closeness). One-and-done state (worker.py) makes
-a satisfied movie permanent, which is what prevents oscillation under relative scoring.
+ACT requires BOTH gate sets to clear: at least one axis must move by a meaningful amount (axis
+gate), AND the TOPSIS closeness must improve by at least min_closeness_gain (closeness gate). A
+pick that moves an axis but barely shifts the overall profile balance is not worth grabbing. When
+there is no current file, both gates are waived. One-and-done state (worker.py) is permanent.
 """
 
 from dataclasses import dataclass
@@ -32,6 +34,22 @@ class Decision:
     pick: dict | None = None  # {score, resolution, gbh, size_gb, closeness, title}
     release: dict | None = None  # raw release to grab (ACT only)
     diag: dict | None = None
+
+
+def _worth_grabbing(
+    pick_raw: dict,
+    cur_info: dict,
+    min_score_delta: int,
+    min_size_delta_gb: float,
+) -> bool:
+    """Return True if the pick clears at least one threshold vs the current file.
+    When the current score is unknown, always return True (treat as an upgrade)."""
+    cur_score = cur_info.get("score")
+    if cur_score is None:
+        return True
+    score_delta = (pick_raw.get("score") or 0) - cur_score
+    size_delta_gb = (cur_info.get("size_gb") or 0) - (pick_raw.get("size_gb") or 0)
+    return score_delta >= min_score_delta or size_delta_gb >= min_size_delta_gb
 
 
 def _current_raw(cf: dict, runtime_h: float) -> dict:
@@ -86,16 +104,21 @@ def decide(
     cur_clo = current["closeness"] if current else None
     current_info = {"closeness": cur_clo, **(current["raw"] if current else cur_raw or {})}
 
-    margin = resolved.min_closeness_gain
-    legal = [t for t in scored if cur_clo is None or t[2] > cur_clo + margin]
+    cfg = topsis.cfg
+    legal = [
+        t
+        for t in scored
+        if _worth_grabbing(t[1]["raw"], current_info, cfg.min_score_delta, cfg.min_size_delta_gb)
+        and (cur_clo is None or t[2] >= cur_clo + cfg.min_closeness_gain)
+    ]
 
     if not legal:
-        # Current file already beats every candidate for its profile -> optimized. Satisfy.
+        # No candidate cleared all ACT gates vs the current file -> current is good enough.
         best = scored[0]
         best_info = {"closeness": best[2], "title": best[0].get("title", "?"), **best[1]["raw"]}
         return Decision(
             "HOLD",
-            "nothing better (current is optimal)",
+            "current is good enough (no candidate cleared axis + closeness gates)",
             satisfy=True,
             profile_name=profile_name,
             current=current_info,

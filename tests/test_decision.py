@@ -108,3 +108,17 @@ def test_unknown_current_score_treated_as_upgrade():
     rels = [_release("a", 900_000, 2160, 10.0), _release("b", 800_000, 2160, 12.0)]
     d = decide(_topsis(), rels, 2.0, "2160p Quality", 2160, current_file=cur)
     assert d.action == "ACT"
+
+
+def test_hold_when_axis_passes_but_closeness_gain_insufficient():
+    # Axis gate passes (score +1000 >= min_score_delta=500) but both candidates have identical
+    # size so the TOPSIS closeness barely shifts -> closeness gate blocks the grab.
+    t = _topsis()
+    t.cfg.min_score_delta = 500
+    t.cfg.min_size_delta_gb = 0.5
+    t.cfg.min_closeness_gain = 0.05
+    cur = _file(900_000, 2160, 20.0)
+    pick = _release("a", 901_000, 2160, 20.0)  # +1000 score, same size -> closeness gain ~0.017
+    other = _release("b", 850_000, 2160, 20.0)  # lower score, same size (filler)
+    d = decide(t, [pick, other], 2.0, "2160p Quality", 2160, current_file=cur)
+    assert d.action == "HOLD" and d.satisfy is True

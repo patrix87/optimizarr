@@ -92,6 +92,20 @@ allow_quality_downgrade = true
 ignore_completed_in_queue = true
 auto_import_downgrades = true
 
+# Active-hours schedule: restrict when the optimizer fetches releases and evaluates movies.
+# Outside the window the worker still processes the queue (auto-imports stuck downloads) but
+# skips list refresh and per-movie evaluation. Times are in local timezone, 24h HH:MM format.
+# A window where start >= end crosses midnight (e.g. 23:00 to 08:00 is active from 23:00 that
+# day until 08:00 the next day). Omit a day or the whole block to be always active on that day.
+[optimizer.schedule]
+sunday    = { start = "23:00", end = "08:00" }
+monday    = { start = "23:00", end = "08:00" }
+tuesday   = { start = "23:00", end = "08:00" }
+wednesday = { start = "23:00", end = "08:00" }
+thursday  = { start = "23:00", end = "08:00" }
+friday    = { start = "23:00", end = "08:00" }
+saturday  = { start = "23:00", end = "08:00" }
+
 # ===== TOPSIS =====
 # Relative two-axis model. There are no per-preset size tables or shapes. For each movie:
 #   1. FILTER the obviously bad: drop negatives, apply three-tier score window (see below), keep
@@ -112,7 +126,7 @@ score_window = 100000
 #   1. Score-window tier: expand to the next tier if fewer than this survive the current one.
 #   2. TOPSIS gate: HOLD without satisfying if fewer than this remain after ALL filters (relative
 #      min-max over a tiny pool is unreliable). The movie is retried when more releases appear.
-min_candidates = 5
+min_candidates = 4
 # Outlier drop: discard a candidate whose GiB/h is below outlier_frac x the median GiB/h of the
 # surviving cluster. This is the key guard against over-compressed / upscale "2160p" junk that
 # Profilarr still scores high on format tags (a real 2160p HEVC is ~4-8 GiB/h; junk is < 2). Without
@@ -121,8 +135,14 @@ min_candidates = 5
 outlier_frac = 0.5
 # Preset used when a profile name matches no preset by keyword.
 default_preset = "Balanced"
-# ACT margin: grab the best candidate only if its closeness beats the current file's by at least
-# this. Hysteresis to avoid churning on a negligible improvement.
+# ACT gate: grab the pick only when it clears at least one of these vs the current file.
+# score must improve by at least min_score_delta, OR size must shrink by at least min_size_delta_gb.
+# If neither threshold is met, the current file is good enough and the item is marked satisfied.
+min_score_delta = 1000
+min_size_delta_gb = 1
+# Closeness gate (AND with the axis gate above): the pick's TOPSIS closeness must also improve
+# by at least this amount vs the current file. Prevents grabbing when an axis moved just enough
+# but the overall profile balance did not meaningfully shift.
 min_closeness_gain = 0.02
 
 # Shared per-resolution legitimacy band {floor, ceiling} in GiB/h (GB = 1024^3). Below floor =
@@ -136,7 +156,7 @@ min_closeness_gain = 0.02
 "480"  = { floor = 0.10, ceiling = 5 }
 
 # ----- Presets -----
-# Each preset = TOPSIS weights (score + size, sum 1.0) + an optional per-preset `min_closeness_gain`.
+# Each preset = TOPSIS weights (score + size, sum 1.0).
 # The pick is always the highest-closeness candidate. Profiles attach to a preset whose name
 # is a (case-insensitive) substring of the profile name; e.g. "2160p Quality" -> Quality. A high
 # size weight (Compact) trades score for the smallest file; a high score weight (Remux) takes the
@@ -162,7 +182,7 @@ size = 0.60
 score = 0.25
 size = 0.75
 
-# Per-profile-name overrides. Reference a preset, or override weights / pick / margin:
+# Per-profile-name overrides. Reference a preset by name, or supply explicit weights:
 # [optimizer.topsis.profiles."2160p Remux"]
 # preset = "Remux"
 # [optimizer.topsis.profiles."My Custom 1080p"]
