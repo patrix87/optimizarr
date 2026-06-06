@@ -1,10 +1,15 @@
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 
 from optimizarr.arr import ArrApi, RadarrApi
 from optimizarr.config import Connection
-from optimizarr.features.optimizer.config import OptimizerAppConfig, OptimizerConfig, default_topsis
+from optimizarr.features.optimizer.config import (
+    OptimizerAppConfig,
+    OptimizerConfig,
+    ScheduleWindow,
+    default_topsis,
+)
 from optimizarr.features.optimizer.state import SATISFIED, StateManager
 from optimizarr.features.optimizer.topsis import GB, Topsis
 from optimizarr.features.optimizer.worker import (
@@ -229,6 +234,9 @@ class _ProcessAdapter(ArrApi):
     def profile_for(self, item):
         return ("2160p Quality", 2160)
 
+    def has_file(self, item):
+        return True
+
     def current_file(self, item):
         return self._current
 
@@ -249,8 +257,11 @@ def _worker(state, dry_run=False):
     w = OptimizerWorker.__new__(OptimizerWorker)
     w.opt = OptimizerConfig(enabled=True)
     w.state = state
-    w.topsis = Topsis(default_topsis())
+    cfg = default_topsis()
+    cfg.min_candidates = 2  # worker tests use 2-candidate pools; pool-size tested in test_topsis
+    w.topsis = Topsis(cfg)
     w.dry_run = dry_run
+    w._schedule_active = None
     return w
 
 
@@ -264,12 +275,15 @@ def test_process_one_hold_marks_satisfied(tmp_path):
     # Current file is already excellent; the candidate is no better -> HOLD -> satisfied.
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=900_000, resolution=2160, size_gb=28.0),  # clearly worse
+        ],
         current_file=_file(score=1_000_000, resolution=2160, size_gb=14.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
     entry = state.get("radarr", 1)
-    assert entry is not None and entry.status == SATISFIED
+    assert entry is not None and entry.status == SATISFIED and entry.profile == "2160p Quality"
     assert adapter.grabbed == []
 
 
@@ -278,7 +292,10 @@ def test_process_one_act_grabs_without_marking(tmp_path):
     # pool until a later evaluation HOLDs (success) or it's retried (failure).
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=950_000, resolution=2160, size_gb=18.0),
+        ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
@@ -382,7 +399,10 @@ def test_importblocked_does_not_count_toward_import_gate(tmp_path):
     ]
     adapter = _GrabQueueAdapter(
         records,
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=950_000, resolution=2160, size_gb=18.0),
+        ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
@@ -422,19 +442,18 @@ def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     w = _worker(state)
     ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}, 3: {"id": 3}}
-    now = datetime.now(UTC)
 
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert set(ctx.pool) == {1, 2, 3}
 
     # Two items processed this pass; a refresh happened (evaluated preserved).
     ctx.evaluated = {1, 2}
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert ctx.pool == [3]  # only the unvisited item remains
 
     # Last item visited -> pool empties -> pass resets to a fresh full sweep.
     ctx.evaluated = {1, 2, 3}
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert set(ctx.pool) == {1, 2, 3}
     assert ctx.evaluated == set()
 
@@ -788,9 +807,128 @@ def test_queue_active_filter_excludes_completed_when_flag_on():
 
 def test_build_pool_excludes_satisfied(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
-    state.mark_satisfied("radarr", 2)
+    state.mark_satisfied("radarr", 2, "2160p Quality")  # same profile the adapter reports
     w = _worker(state)
     ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}}
-    w._build_pool(ctx, datetime.now(UTC))
-    assert ctx.pool == [1]  # satisfied item 2 is out of the pool
+    w._build_pool(ctx)
+    assert ctx.pool == [1]  # satisfied item 2 (same profile, has file) is out of the pool
+
+
+# ----- schedule / active hours -----
+
+# June 2026 reference days (verified against calendar):
+#   2026-06-01 = Monday   (weekday 0)
+#   2026-06-07 = Sunday   (weekday 6)
+#   2026-06-08 = Monday   (weekday 0)
+
+_ALL_DAYS_23_08 = {wd: ScheduleWindow(time(23, 0), time(8, 0)) for wd in range(7)}
+
+
+def _sched_worker():
+    w = OptimizerWorker.__new__(OptimizerWorker)
+    w.opt = OptimizerConfig(enabled=True)
+    w._schedule_active = None
+    return w
+
+
+def test_in_active_hours_empty_schedule_always_active():
+    w = _sched_worker()
+    w.opt.schedule = {}
+    assert w._in_active_hours(datetime(2026, 6, 1, 14, 0))  # any time, any day
+
+
+def test_in_active_hours_same_day_window_inside():
+    w = _sched_worker()
+    w.opt.schedule = {0: ScheduleWindow(time(9, 0), time(17, 0))}  # Monday 09:00-17:00
+    assert w._in_active_hours(datetime(2026, 6, 1, 12, 0))  # inside
+    assert w._in_active_hours(datetime(2026, 6, 1, 9, 0))  # on the start boundary
+    assert not w._in_active_hours(datetime(2026, 6, 1, 8, 59))  # just before
+    assert not w._in_active_hours(datetime(2026, 6, 1, 17, 0))  # on the end boundary (exclusive)
+    assert not w._in_active_hours(datetime(2026, 6, 1, 18, 0))  # after window
+
+
+def test_in_active_hours_cross_midnight_window():
+    # 23:00 Sunday -> 08:00 Monday: default schedule.
+    w = _sched_worker()
+    w.opt.schedule = _ALL_DAYS_23_08
+
+    # Sunday 23:30 -> active (Sunday window, today portion, t >= s)
+    assert w._in_active_hours(datetime(2026, 6, 7, 23, 30))
+    # Sunday 22:59 -> inactive (before Sunday window starts)
+    assert not w._in_active_hours(datetime(2026, 6, 7, 22, 59))
+    # Monday 00:30 -> active (yesterday=Sunday crossed midnight, t < e=08:00)
+    assert w._in_active_hours(datetime(2026, 6, 8, 0, 30))
+    # Monday 07:59 -> active (still in Sunday's cross-midnight tail)
+    assert w._in_active_hours(datetime(2026, 6, 8, 7, 59))
+    # Monday 08:00 -> inactive (end boundary is exclusive; Monday's own window starts at 23:00)
+    assert not w._in_active_hours(datetime(2026, 6, 8, 8, 0))
+    # Monday 14:00 -> inactive (daytime gap)
+    assert not w._in_active_hours(datetime(2026, 6, 8, 14, 0))
+    # Monday 23:00 -> active (Monday's own window begins)
+    assert w._in_active_hours(datetime(2026, 6, 8, 23, 0))
+
+
+def test_in_active_hours_no_entry_for_today():
+    # Schedule has Monday only; on a different day -> inactive.
+    w = _sched_worker()
+    w.opt.schedule = {0: ScheduleWindow(time(23, 0), time(8, 0))}
+    # Sunday (no entry, yesterday is Saturday which also has no entry) -> inactive
+    assert not w._in_active_hours(datetime(2026, 6, 7, 23, 30))
+
+
+def test_process_app_once_skips_evaluation_outside_active_hours(tmp_path):
+    # When _active=False is passed, the worker must still run queue imports but skip
+    # pool building, refresh, and item processing (return False).
+    state = StateManager(str(tmp_path / "s.json"))
+
+    class _TrackingAdapter(_GrabQueueAdapter):
+        def __init__(self):
+            super().__init__(
+                records=[],
+                releases=[_release()],
+                current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
+            )
+            self.queue_called = False
+
+        def queue_items(self):
+            self.queue_called = True
+            return []
+
+    adapter = _TrackingAdapter()
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx.items_by_id = {1: {"id": 1}}
+    ctx.pool = [1]
+    ctx.last_refresh = datetime.now(UTC)
+
+    w = _worker(state)
+    result = w._process_app_once(ctx, _active=False)
+
+    assert result is False
+    assert ctx.pool == [1]  # pool must not have been consumed
+    assert adapter.grabbed == []  # no grab
+    # Queue was still fetched (handle_queue_imports always runs, even outside hours).
+    assert adapter.queue_called
+
+
+def test_process_app_once_active_override_proceeds_normally(tmp_path):
+    # When _active=True is passed, the default all-day schedule is bypassed and evaluation runs.
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _GrabQueueAdapter(
+        records=[],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(guid="g2", score=950_000, resolution=2160, size_gb=18.0),
+        ],
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
+    )
+    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx.items_by_id = {1: {"id": 1}}
+    ctx.pool = [1]
+    ctx.last_refresh = datetime.now(UTC)
+
+    w = _worker(state)
+    result = w._process_app_once(ctx, _active=True)
+
+    assert result is True
+    assert len(adapter.grabbed) == 1

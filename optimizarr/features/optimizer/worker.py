@@ -210,6 +210,7 @@ class OptimizerWorker:
         self.topsis = Topsis(self.opt.topsis)
         self.dry_run = config.dry_run
         self._stop = threading.Event()
+        self._schedule_active: bool | None = None  # None = unknown (first tick)
 
         conns = {"radarr": config.radarr, "sonarr": config.sonarr}
         app_cfgs = {"radarr": self.opt.radarr, "sonarr": self.opt.sonarr}
@@ -226,15 +227,24 @@ class OptimizerWorker:
 
     def _refresh(self, ctx: _AppContext, now: datetime) -> None:
         adapter = ctx.adapter
-        adapter.refresh_profiles()
-        # Select on hasFile alone (not monitored): the optimizer improves the existing
-        # library, and the unmonitor feature deliberately strips monitoring once a file
-        # exists. The age gate is the optimizer's own min_age_days.
-        items = [
-            it
-            for it in adapter.list_items()
-            if adapter.has_file(it) and age_ok(adapter, it, ctx.app_cfg, now)
-        ]
+        # Safe reconciliation: a failed or interrupted library fetch must NEVER clear the known
+        # item set (and we never prune state from the list anyway). On error, keep the previous
+        # items_by_id and retry on the next tick (last_refresh is left unchanged).
+        try:
+            adapter.refresh_profiles()
+            # Select on hasFile alone (not monitored): the optimizer improves the existing
+            # library, and the unmonitor feature deliberately strips monitoring once a file
+            # exists. The age gate is the optimizer's own min_age_days.
+            items = [
+                it
+                for it in adapter.list_items()
+                if adapter.has_file(it) and age_ok(adapter, it, ctx.app_cfg, now)
+            ]
+        except Exception:
+            logger.exception(
+                "[%s] library refresh failed; keeping the previous item set", adapter.app
+            )
+            return
         ctx.items_by_id = {adapter.item_id(it): it for it in items}
         # NB: ctx.evaluated is intentionally NOT cleared here. A refresh only updates the
         # candidate set (new items become pickable, removed ones drop); the current pass
@@ -243,17 +253,45 @@ class OptimizerWorker:
         ctx.last_refresh = now
         logger.info("[%s] list refreshed: %d items with files", adapter.app, len(items))
 
-    def _build_pool(self, ctx: _AppContext, now: datetime) -> None:
-        days = self.opt.reevaluate_after_days
+    def _in_active_hours(self, now_local: datetime | None = None) -> bool:
+        """Return True if the current local time is inside the configured active window.
+        An empty schedule means always active. A window where start >= end crosses midnight:
+        e.g. start=23:00, end=08:00 is active from 23:00 that day through 08:00 the next."""
+        schedule = self.opt.schedule
+        if not schedule:
+            return True
+        t = (now_local or datetime.now()).time()
+        today = (now_local or datetime.now()).weekday()  # 0=Mon, 6=Sun
+        yesterday = (today - 1) % 7
+
+        if today in schedule:
+            s, e = schedule[today].start, schedule[today].end
+            if s < e:  # same-day window: active between s and e
+                if s <= t < e:
+                    return True
+            elif t >= s:  # cross-midnight: today's portion (s until midnight)
+                return True
+
+        if yesterday in schedule:
+            s, e = schedule[yesterday].start, schedule[yesterday].end
+            if s >= e and t < e:  # yesterday's window crosses into today (midnight until e)
+                return True
+
+        return False
+
+    def _build_pool(self, ctx: _AppContext) -> None:
         app = ctx.adapter.app
+        adapter = ctx.adapter
 
         def active(exclude_evaluated: bool) -> list[int]:
-            return [
-                item_id
-                for item_id in ctx.items_by_id
-                if self.state.is_active(app, item_id, now, days)
-                and not (exclude_evaluated and item_id in ctx.evaluated)
-            ]
+            out: list[int] = []
+            for item_id, item in ctx.items_by_id.items():
+                if exclude_evaluated and item_id in ctx.evaluated:
+                    continue
+                profile_name, _target_res = adapter.profile_for(item)
+                if self.state.is_active(app, item_id, profile_name, adapter.has_file(item)):
+                    out.append(item_id)
+            return out
 
         ctx.pool = active(exclude_evaluated=True)
         if not ctx.pool and ctx.evaluated:
@@ -285,9 +323,10 @@ class OptimizerWorker:
         logger.info("%s", format_decision(adapter.app, label, decision, self.dry_run))
 
         if decision.action == "HOLD":
-            # Nothing better (incl. no viable release): drop it from the pool.
-            if not self.dry_run:
-                self.state.mark_satisfied(adapter.app, item_id)
+            # Satisfy (permanently) ONLY when the current imported file is optimal for its profile.
+            # An insufficient-candidates HOLD (decision.satisfy=False) is left in the pool to retry.
+            if decision.satisfy and not self.dry_run:
+                self.state.mark_satisfied(adapter.app, item_id, profile_name)
             return
 
         # ACT: grab, but do NOT record anything. If the download succeeds, the next
@@ -437,18 +476,33 @@ class OptimizerWorker:
                 # Nothing actionable (queue full or pool exhausted): wait one short tick.
                 self._sleep(self.opt.process_interval_seconds)
 
-    def _process_app_once(self, ctx: _AppContext) -> bool:
-        """Do at most one unit of work for an app. Returns True if an item was processed."""
+    def _process_app_once(self, ctx: _AppContext, _active: bool | None = None) -> bool:
+        """Do at most one unit of work for an app. Returns True if an item was processed.
+
+        `_active` overrides the schedule check (for tests); omit to use real local time."""
         now = datetime.now(UTC)
         adapter = ctx.adapter
+        active = self._in_active_hours() if _active is None else _active
 
-        if ctx.needs_refresh(now, self.opt.list_refresh_minutes):
+        if active != self._schedule_active:
+            self._schedule_active = active
+            if active:
+                logger.info("[optimizer] entered active hours; resuming evaluation")
+            else:
+                logger.info(
+                    "[optimizer] outside active hours; skipping evaluation (queue imports continue)"
+                )
+
+        # List refresh and pool rebuild only happen inside active hours.
+        if active and ctx.needs_refresh(now, self.opt.list_refresh_minutes):
             self._refresh(ctx, now)
             ctx.pool = []  # force rebuild below
 
-        # Auto-import stuck downgrades first so they stop blocking the queue (and so the
-        # item-id skip set below doesn't keep them locked out forever).
+        # Auto-import stuck downgrades always runs so the queue drains regardless of schedule.
         self._handle_queue_imports(ctx)
+
+        if not active:
+            return False
 
         # One queue fetch serves both the global gate and the per-item skip. The gate's count
         # optionally filters out items already past download (waiting for or doing import) —
@@ -462,7 +516,7 @@ class OptimizerWorker:
         import_count = sum(1 for r in records if adapter.is_queue_item_pending_import(r))
 
         if not ctx.pool:
-            self._build_pool(ctx, now)
+            self._build_pool(ctx)
         if not ctx.pool:
             return False
 

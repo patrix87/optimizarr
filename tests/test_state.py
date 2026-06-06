@@ -1,5 +1,3 @@
-from datetime import UTC, datetime, timedelta
-
 from optimizarr.features.optimizer.state import SATISFIED, StateManager
 
 
@@ -12,26 +10,31 @@ def test_missing_file_starts_empty(tmp_path):
     assert m.get("radarr", 1) is None
 
 
-def test_mark_satisfied_and_persist(tmp_path):
+def test_mark_satisfied_persists_profile(tmp_path):
     path = tmp_path / "state.json"
     m = StateManager(str(path))
-    m.mark_satisfied("radarr", 42)
+    m.mark_satisfied("radarr", 42, "2160p Quality")
     assert path.exists()
 
     reloaded = StateManager(str(path))
     entry = reloaded.get("radarr", 42)
     assert entry is not None
     assert entry.status == SATISFIED
+    assert entry.profile == "2160p Quality"
 
 
-def test_is_active_lifecycle(tmp_path):
+def test_is_active_one_and_done(tmp_path):
     m = _mgr(tmp_path)
-    now = datetime.now(UTC)  # marks stamp wall-clock time; base offsets on real now
 
-    # Unprocessed -> active
-    assert m.is_active("radarr", 1, now, reevaluate_after_days=30)
+    # Unprocessed -> active.
+    assert m.is_active("radarr", 1, "2160p Quality", has_file=True)
 
-    # Satisfied within window -> not active; past window -> active again
-    m.mark_satisfied("radarr", 2)
-    assert not m.is_active("radarr", 2, now + timedelta(days=10), reevaluate_after_days=30)
-    assert m.is_active("radarr", 2, now + timedelta(days=31), reevaluate_after_days=30)
+    # Satisfied for its profile, with a file -> not active (one-and-done, no time re-eval).
+    m.mark_satisfied("radarr", 2, "2160p Quality")
+    assert not m.is_active("radarr", 2, "2160p Quality", has_file=True)
+
+    # Profile changed -> active again (the optimal pick depends on the profile).
+    assert m.is_active("radarr", 2, "2160p Efficient", has_file=True)
+
+    # File removed -> active again (needs a fresh grab).
+    assert m.is_active("radarr", 2, "2160p Quality", has_file=False)

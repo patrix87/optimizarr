@@ -1,31 +1,34 @@
 """Pure per-item decision: given fetched data, return ACT (with the release) or HOLD.
 
-"Optimized" means the algorithm can no longer find anything better than the current file
-(HOLD) — never merely "we triggered a grab". The decision is:
+"Optimized" means the algorithm can no longer find anything better than the current file (a
+HOLD that *satisfies*), never merely "we triggered a grab". The decision is:
 
-  1. **Prefilter + score** (topsis.py): drop hard rejections, drop outside the preset's size band
-     (floor..bloat), gap-cut the score tail, then score the survivors by TOPSIS closeness.
-  2. **Swap rule** (here): a candidate is legal iff it raises closeness by at least the preset's
-     `min_closeness_gain` AND it does not drop resolution below the profile target. Because
-     closeness is computed from the release alone (not the current file), every accepted swap
-     strictly increases it, so the optimizer is provably non-oscillating.
-  3. **Pick** (topsis.py): choose among the legal candidates by the profile's pick method.
+  1. **Filter + score** (topsis.py): drop hard rejections, drop score below the downgrade budget
+     (`current - score_window`), keep only the target resolution, drop outside the legitimacy band,
+     drop lone-small outliers, then min-max normalize the survivors on two relative axes (score,
+     GiB/h) and combine with the profile's weights into a TOPSIS closeness.
+  2. **Decide** (here): if too few candidates survived to compare, HOLD WITHOUT satisfying (retry
+     later). Otherwise ACT on the best candidate iff it clears BOTH gate sets vs the current file:
+     axis gate (score improves >= min_score_delta OR size shrinks >= min_size_delta_gb) AND
+     closeness gate (TOPSIS closeness improves >= min_closeness_gain). Both must pass.
+     If no candidate clears both, HOLD and SATISFY (the current file is already good enough).
 
-ACT iff at least one candidate is legal; otherwise HOLD (and the worker marks the item satisfied).
+ACT requires BOTH gate sets to clear: at least one axis must move by a meaningful amount (axis
+gate), AND the TOPSIS closeness must improve by at least min_closeness_gain (closeness gate). A
+pick that moves an axis but barely shifts the overall profile balance is not worth grabbing. When
+there is no current file, both gates are waived. One-and-done state (worker.py) is permanent.
 """
 
 from dataclasses import dataclass
 
-from optimizarr.features.optimizer.topsis import Topsis
-
-# Sentinel "no cap" for the resolution guard when a profile exposes no target resolution.
-_NO_CAP = 10**9
+from optimizarr.features.optimizer.topsis import GB, Topsis
 
 
 @dataclass
 class Decision:
     action: str  # "ACT" or "HOLD"
     reason: str
+    satisfy: bool = False  # HOLD only: True => current file is optimal, mark satisfied (permanent)
     profile_name: str | None = None
     current: dict | None = None  # {score, resolution, gbh, size_gb, closeness}
     pick: dict | None = None  # {score, resolution, gbh, size_gb, closeness, title}
@@ -33,30 +36,27 @@ class Decision:
     diag: dict | None = None
 
 
-def resolution_ok(cur_res: int, cand_res: int, target_res: int | None) -> bool:
-    """Resolution may rise toward the target or fall only as far as the target, never below it.
-    `min(res, target)` makes over-target resolutions equivalent, so a leaner profile (lower
-    target) can still drop resolution down to its target while a normal profile never drops."""
-    cap = target_res if target_res else _NO_CAP
-    return min(cand_res, cap) >= min(cur_res, cap)
-
-
-def swap_allowed(
-    cur_closeness: float | None,
-    cand_closeness: float,
-    cur_res: int,
-    cand_res: int,
-    target_res: int | None,
-    min_gain: float,
+def _worth_grabbing(
+    pick_raw: dict,
+    cur_info: dict,
+    min_score_delta: int,
+    min_size_delta_gb: float,
 ) -> bool:
-    """The swap rule: a candidate is legal iff resolution doesn't drop below target AND closeness
-    improves by at least `min_gain`. An unknown current score (cur_closeness is None) is the worst
-    case, so any scored candidate that clears the resolution guard is an improvement."""
-    if not resolution_ok(cur_res, cand_res, target_res):
-        return False
-    if cur_closeness is None:
+    """Return True if the pick clears at least one threshold vs the current file.
+    When the current score is unknown, always return True (treat as an upgrade)."""
+    cur_score = cur_info.get("score")
+    if cur_score is None:
         return True
-    return cand_closeness >= cur_closeness + min_gain
+    score_delta = (pick_raw.get("score") or 0) - cur_score
+    size_delta_gb = (cur_info.get("size_gb") or 0) - (pick_raw.get("size_gb") or 0)
+    return score_delta >= min_score_delta or size_delta_gb >= min_size_delta_gb
+
+
+def _current_raw(cf: dict, runtime_h: float) -> dict:
+    size_gb = (cf.get("size", 0) or 0) / GB
+    gbh = (size_gb / runtime_h) if (runtime_h and runtime_h > 0) else 0.0
+    res = ((cf.get("quality") or {}).get("quality") or {}).get("resolution") or 0
+    return {"score": cf.get("customFormatScore"), "resolution": res, "gbh": gbh, "size_gb": size_gb}
 
 
 def decide(
@@ -69,8 +69,9 @@ def decide(
     allow_size_increase: bool = True,
     allow_quality_downgrade: bool = True,
 ) -> Decision:
-    """Pure decision: score the candidates, then keep those that raise closeness past the margin
-    without dropping resolution below target, and pick the best survivor.
+    """Pure decision: filter + relatively score the candidates, then ACT on the best one if it
+    beats the current file's closeness, else HOLD (satisfying iff there were enough candidates to
+    trust the comparison).
 
     Two optional pre-filters apply before scoring (per-app policy):
       - allow_size_increase=False drops releases bigger than the current file;
@@ -84,42 +85,57 @@ def decide(
         releases = [r for r in releases if (r.get("customFormatScore") or 0) >= cur_score]
 
     resolved = topsis.resolve_profile(profile_name)
-    scored, diag = topsis.score_candidates(releases, runtime_h, resolved, target_resolution)
+    kept, diag = topsis.apply_prefilters(releases, runtime_h, target_resolution, cur_score)
 
-    current_closeness, cur_raw = topsis.closeness_for_current_file(
-        cur, runtime_h, resolved, target_resolution
-    )
-    current = {"closeness": current_closeness, **cur_raw}
-    cur_res = cur_raw.get("resolution", 0) or 0
+    cur_raw = _current_raw(cur, runtime_h) if current_file else None
 
-    legal: list[tuple[dict, dict, float]] = []
-    for rel, attrs, clo in scored:
-        if swap_allowed(
-            current_closeness,
-            clo,
-            cur_res,
-            attrs["raw"]["resolution"],
-            target_resolution,
-            resolved.min_closeness_gain,
-        ):
-            legal.append((rel, attrs, clo))
-    diag["after_swap_gate"] = len(legal)
+    # Not enough to compare: HOLD but do NOT satisfy, so the movie is retried when more appear.
+    if len(kept) < topsis.cfg.min_candidates:
+        return Decision(
+            "HOLD",
+            f"too few candidates to compare ({len(kept)} < {topsis.cfg.min_candidates})",
+            satisfy=False,
+            profile_name=profile_name,
+            current={"closeness": None, **cur_raw} if cur_raw else None,
+            diag=diag,
+        )
+
+    scored, current = topsis.score_pool(kept, current_file, runtime_h, resolved)
+    cur_clo = current["closeness"] if current else None
+    current_info = {"closeness": cur_clo, **(current["raw"] if current else cur_raw or {})}
+
+    cfg = topsis.cfg
+    legal = [
+        t
+        for t in scored
+        if _worth_grabbing(t[1]["raw"], current_info, cfg.min_score_delta, cfg.min_size_delta_gb)
+        and (cur_clo is None or t[2] >= cur_clo + cfg.min_closeness_gain)
+    ]
 
     if not legal:
-        why = f"no viable candidate ({diag['inclusion']})" if not scored else "nothing better"
-        return Decision("HOLD", why, profile_name=profile_name, current=current, diag=diag)
+        # No candidate cleared all ACT gates vs the current file -> current is good enough.
+        best = scored[0]
+        best_info = {"closeness": best[2], "title": best[0].get("title", "?"), **best[1]["raw"]}
+        return Decision(
+            "HOLD",
+            "current is good enough (no candidate cleared axis + closeness gates)",
+            satisfy=True,
+            profile_name=profile_name,
+            current=current_info,
+            pick=best_info,
+            diag=diag,
+        )
 
-    selected = topsis.select(legal, resolved)
-    assert selected is not None  # legal is non-empty (guarded above); select is None only on []
-    release, attrs, pick_closeness = selected
-    pick_info = {"closeness": pick_closeness, "title": release.get("title", "?"), **attrs["raw"]}
+    rel, attrs, clo = legal[0]  # scored is sorted best-first, so this is the highest closeness
+    pick_info = {"closeness": clo, "title": rel.get("title", "?"), **attrs["raw"]}
     return Decision(
         "ACT",
-        f"closeness-gain {resolved.pick} pick of {len(legal)}",
+        f"best of {len(legal)} (closeness {clo:.3f})",
+        satisfy=False,
         profile_name=profile_name,
-        current=current,
+        current=current_info,
         pick=pick_info,
-        release=release,
+        release=rel,
         diag=diag,
     )
 

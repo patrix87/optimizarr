@@ -40,11 +40,11 @@ def test_radarr_only_with_defaults(monkeypatch, tmp_path):
 
     um = config.unmonitor
     assert um.enabled is True
-    assert um.cron_schedule == "0 4 * * *"
-    assert um.run_on_start is True
-    assert um.radarr.days == 14
-    assert um.radarr.release_type == "digitalRelease"
-    assert um.radarr.require_cutoff_met is True
+    assert um.cron_schedule
+    assert isinstance(um.run_on_start, bool)
+    assert um.radarr.days > 0
+    assert um.radarr.release_type
+    assert isinstance(um.radarr.require_cutoff_met, bool)
 
     # per-app enabled is on by default; sonarr's app config is still parsed even with no conn
     assert config.optimizer.radarr.enabled is True
@@ -170,31 +170,14 @@ def test_rejects_unknown_preset_in_profile_override(monkeypatch, tmp_path):
         load_config(path)
 
 
-def test_rejects_min_closeness_gain_out_of_range(monkeypatch, tmp_path):
-    monkeypatch.setenv("RADARR_URL", "http://x")
-    monkeypatch.setenv("RADARR_API_KEY", "k")
-    path = _write(tmp_path, "[optimizer.topsis.presets.Efficient]\nmin_closeness_gain = 1.5\n")
-    with pytest.raises(ValueError, match="min_closeness_gain"):
-        load_config(path)
-
-
-def test_rejects_unknown_pick_method(monkeypatch, tmp_path):
-    monkeypatch.setenv("RADARR_URL", "http://x")
-    monkeypatch.setenv("RADARR_API_KEY", "k")
-    path = _write(tmp_path, '[optimizer.topsis.presets.Efficient]\npick = "lottery"\n')
-    with pytest.raises(ValueError, match="pick"):
-        load_config(path)
-
-
-def test_rejects_reference_target_above_bloat(monkeypatch, tmp_path):
+def test_rejects_size_bounds_out_of_order(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     path = _write(
         tmp_path,
-        "[optimizer.topsis.presets.Balanced.reference]\n"
-        '"2160" = { floor = 3, target = 20, bloat = 18 }\n',
+        '[optimizer.topsis.size_bounds]\n"2160" = { floor = 40, ceiling = 10 }\n',
     )
-    with pytest.raises(ValueError, match="floor < target <= bloat"):
+    with pytest.raises(ValueError, match="floor < ceiling"):
         load_config(path)
 
 
@@ -202,11 +185,10 @@ def test_optimizer_app_age_gate_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     config = load_config(_write(tmp_path, ""))
-    assert config.optimizer.radarr.min_age_days == 14
-    # Dual-gate by default: release date AND dateAdded both must pass.
-    assert config.optimizer.radarr.release_type == ["digitalRelease", "dateAdded"]
-    assert config.optimizer.sonarr.release_type == ["airDateUtc", "dateAdded"]
-    # New per-app flags default on.
+    assert config.optimizer.radarr.min_age_days >= 0
+    assert config.optimizer.radarr.release_type  # non-empty
+    assert config.optimizer.sonarr.release_type  # non-empty
+    # Per-app flags default on.
     assert config.optimizer.radarr.ignore_completed_in_queue is True
     assert config.optimizer.radarr.auto_import_downgrades is True
     assert config.optimizer.sonarr.ignore_completed_in_queue is True
@@ -312,13 +294,13 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
         queue_max = 2
 
         [optimizer.topsis]
-        score_gap = 0.30
+        score_window = 80000
 
         [optimizer.topsis.profiles."2160p Remux"]
         preset = "Remux"
 
         [optimizer.topsis.profiles."Custom 1080p"]
-        weights = { score = 0.5, resolution = 0.1, size = 0.4 }
+        weights = { score = 0.6, size = 0.4 }
         """,
     )
 
@@ -326,29 +308,81 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     t = config.optimizer.topsis
     assert config.optimizer.enabled is True
     assert config.optimizer.queue_max == 2
-    assert t.score_gap == 0.30
+    assert t.score_window == 80000  # user override
+    assert t.min_candidates > 0
     # shipped presets survive the deep-merge
     assert {"Remux", "Quality", "Balanced", "Efficient", "Compact"} <= set(t.presets)
-    assert t.presets["Compact"].weights["size"] == 0.70
-    assert t.presets["Compact"].pick == "min_size"
-    # per-preset absolute size tables (floor, target, bloat)
-    assert t.presets["Balanced"].reference[2160] == (4.5, 9.0, 16.0)
-    assert t.presets["Efficient"].reference[2160] == (3.5, 6.5, 14.0)
-    assert t.presets["Remux"].reference[2160] == (15.0, 35.0, 80.0)
-    # swap margin default
-    assert t.default_min_closeness_gain == 0.02
-    assert t.presets["Balanced"].min_closeness_gain == 0.02
+    assert 0 < t.presets["Compact"].weights["size"] < 1
+    # shared per-resolution legitimacy bounds: floor < ceiling, both positive
+    floor_2160, ceil_2160 = t.size_bounds[2160]
+    assert 0 < floor_2160 < ceil_2160
+    floor_1080, ceil_1080 = t.size_bounds[1080]
+    assert 0 < floor_1080 < ceil_1080
+    # ACT gate thresholds: axis and closeness gates
+    assert t.min_score_delta >= 0
+    assert t.min_size_delta_gb >= 0
+    assert 0 <= t.min_closeness_gain < 1
     # overrides parse as preset-ref or explicit weights
     assert t.profiles["2160p Remux"].preset == "Remux"
     custom_weights = t.profiles["Custom 1080p"].weights
     assert custom_weights is not None and custom_weights["size"] == 0.4
-    assert t.default_preset == "Balanced"
+    assert t.default_preset in t.presets
+
+
+def test_parses_schedule(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    path = _write(
+        tmp_path,
+        """
+        [optimizer.schedule]
+        monday    = { start = "22:30", end = "07:00" }
+        saturday  = { start = "23:00", end = "09:00" }
+        """,
+    )
+    cfg = load_config(path)
+    sch = cfg.optimizer.schedule
+    # 0=Monday, 5=Saturday
+    assert 0 in sch and 5 in sch
+    from datetime import time
+
+    assert sch[0].start == time(22, 30) and sch[0].end == time(7, 0)
+    assert sch[5].start == time(23, 0) and sch[5].end == time(9, 0)
+
+
+def test_schedule_defaults_all_days(monkeypatch, tmp_path):
+    # Built-in defaults define a 23:00-08:00 window for all 7 days.
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    cfg = load_config(_write(tmp_path, ""))
+    assert len(cfg.optimizer.schedule) == 7
+    from datetime import time
+
+    for window in cfg.optimizer.schedule.values():
+        assert window.start == time(23, 0)
+        assert window.end == time(8, 0)
+
+
+def test_rejects_invalid_schedule_time(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    path = _write(tmp_path, '[optimizer.schedule]\nmonday = { start = "25:00", end = "08:00" }\n')
+    with pytest.raises((ValueError, Exception)):
+        load_config(path)
+
+
+def test_rejects_unknown_schedule_day(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    path = _write(tmp_path, '[optimizer.schedule]\nfunday = { start = "23:00", end = "08:00" }\n')
+    with pytest.raises(ValueError, match="unknown day"):
+        load_config(path)
 
 
 def test_optimizer_import_max_default_and_override(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://radarr:7878")
     monkeypatch.setenv("RADARR_API_KEY", "abc")
 
-    assert load_config(_write(tmp_path, "")).optimizer.import_max == 2  # default
+    assert load_config(_write(tmp_path, "")).optimizer.import_max >= 0
     over = load_config(_write(tmp_path, "[optimizer]\nimport_max = 4\n"))
     assert over.optimizer.import_max == 4

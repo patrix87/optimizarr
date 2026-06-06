@@ -151,10 +151,9 @@ def log_summary(config: Config) -> None:
     )
     if opt.enabled:
         logger.info(
-            "  optimizer: process_interval=%ds list_refresh=%dm reevaluate_after=%dd",
+            "  optimizer: process_interval=%ds list_refresh=%dm (one-and-done, no auto re-eval)",
             opt.process_interval_seconds,
             opt.list_refresh_minutes,
-            opt.reevaluate_after_days,
         )
         for name, app in (("radarr", opt.radarr), ("sonarr", opt.sonarr)):
             logger.info(
