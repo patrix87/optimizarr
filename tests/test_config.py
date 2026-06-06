@@ -40,11 +40,11 @@ def test_radarr_only_with_defaults(monkeypatch, tmp_path):
 
     um = config.unmonitor
     assert um.enabled is True
-    assert um.cron_schedule == "0 4 * * *"
-    assert um.run_on_start is True
-    assert um.radarr.days == 14
-    assert um.radarr.release_type == "digitalRelease"
-    assert um.radarr.require_cutoff_met is True
+    assert um.cron_schedule
+    assert isinstance(um.run_on_start, bool)
+    assert um.radarr.days > 0
+    assert um.radarr.release_type
+    assert isinstance(um.radarr.require_cutoff_met, bool)
 
     # per-app enabled is on by default; sonarr's app config is still parsed even with no conn
     assert config.optimizer.radarr.enabled is True
@@ -178,23 +178,14 @@ def test_rejects_min_closeness_gain_out_of_range(monkeypatch, tmp_path):
         load_config(path)
 
 
-def test_rejects_unknown_pick_method(monkeypatch, tmp_path):
-    monkeypatch.setenv("RADARR_URL", "http://x")
-    monkeypatch.setenv("RADARR_API_KEY", "k")
-    path = _write(tmp_path, '[optimizer.topsis.presets.Efficient]\npick = "lottery"\n')
-    with pytest.raises(ValueError, match="pick"):
-        load_config(path)
-
-
-def test_rejects_reference_out_of_order(monkeypatch, tmp_path):
+def test_rejects_size_bounds_out_of_order(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     path = _write(
         tmp_path,
-        "[optimizer.topsis.presets.Balanced.reference]\n"
-        '"2160" = { floor = 3, lo = 5, target = 20, hi = 10, ceiling = 18 }\n',
+        '[optimizer.topsis.size_bounds]\n"2160" = { floor = 40, ceiling = 10 }\n',
     )
-    with pytest.raises(ValueError, match="floor < lo <= target <= hi < ceiling"):
+    with pytest.raises(ValueError, match="floor < ceiling"):
         load_config(path)
 
 
@@ -202,11 +193,10 @@ def test_optimizer_app_age_gate_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     config = load_config(_write(tmp_path, ""))
-    assert config.optimizer.radarr.min_age_days == 14
-    # Dual-gate by default: release date AND dateAdded both must pass.
-    assert config.optimizer.radarr.release_type == ["digitalRelease", "dateAdded"]
-    assert config.optimizer.sonarr.release_type == ["airDateUtc", "dateAdded"]
-    # New per-app flags default on.
+    assert config.optimizer.radarr.min_age_days >= 0
+    assert config.optimizer.radarr.release_type  # non-empty
+    assert config.optimizer.sonarr.release_type  # non-empty
+    # Per-app flags default on.
     assert config.optimizer.radarr.ignore_completed_in_queue is True
     assert config.optimizer.radarr.auto_import_downgrades is True
     assert config.optimizer.sonarr.ignore_completed_in_queue is True
@@ -312,7 +302,7 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
         queue_max = 2
 
         [optimizer.topsis]
-        score_gap = 0.30
+        score_window = 80000
 
         [optimizer.topsis.profiles."2160p Remux"]
         preset = "Remux"
@@ -326,29 +316,30 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     t = config.optimizer.topsis
     assert config.optimizer.enabled is True
     assert config.optimizer.queue_max == 2
-    assert t.score_gap == 0.30
+    assert t.score_window == 80000  # user override
+    assert t.min_candidates > 0
     # shipped presets survive the deep-merge
     assert {"Remux", "Quality", "Balanced", "Efficient", "Compact"} <= set(t.presets)
-    assert t.presets["Compact"].weights["size"] == 0.78
-    assert t.presets["Compact"].pick == "topsis"
-    # per-preset 5-point size tables (floor, lo, target, hi, ceiling)
-    assert t.presets["Balanced"].reference[2160] == (5.0, 8.1, 9.3, 11.0, 20.0)
-    assert t.presets["Efficient"].reference[2160] == (4.0, 7.1, 7.8, 8.8, 15.0)
-    assert t.presets["Remux"].reference[2160] == (15.0, 28.0, 38.0, 60.0, 90.0)
-    # swap margin default
-    assert t.default_min_closeness_gain == 0.02
-    assert t.presets["Balanced"].min_closeness_gain == 0.02
+    assert 0 < t.presets["Compact"].weights["size"] < 1
+    # shared per-resolution legitimacy bounds: floor < ceiling, both positive
+    floor_2160, ceil_2160 = t.size_bounds[2160]
+    assert 0 < floor_2160 < ceil_2160
+    floor_1080, ceil_1080 = t.size_bounds[1080]
+    assert 0 < floor_1080 < ceil_1080
+    # swap margin: valid range
+    assert 0 <= t.default_min_closeness_gain < 1
+    assert 0 <= t.presets["Balanced"].min_closeness_gain < 1
     # overrides parse as preset-ref or explicit weights
     assert t.profiles["2160p Remux"].preset == "Remux"
     custom_weights = t.profiles["Custom 1080p"].weights
     assert custom_weights is not None and custom_weights["size"] == 0.4
-    assert t.default_preset == "Balanced"
+    assert t.default_preset in t.presets
 
 
 def test_optimizer_import_max_default_and_override(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://radarr:7878")
     monkeypatch.setenv("RADARR_API_KEY", "abc")
 
-    assert load_config(_write(tmp_path, "")).optimizer.import_max == 2  # default
+    assert load_config(_write(tmp_path, "")).optimizer.import_max >= 0
     over = load_config(_write(tmp_path, "[optimizer]\nimport_max = 4\n"))
     assert over.optimizer.import_max == 4

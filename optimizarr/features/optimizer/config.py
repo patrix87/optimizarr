@@ -1,22 +1,15 @@
 """Optimizer feature configuration: schema + parsing of the [optimizer] TOML section.
 
-Tuning values (per-preset size tables, score anchors) come from the merged config
-(defaults.toml + the user's config.toml) — there are no magic defaults baked into this module.
-The shared loader (optimizarr.config) delegates to parse_optimizer() here.
+Tuning values come from the merged config (defaults.toml + the user's config.toml); there are no
+magic defaults baked into this module. The shared loader (optimizarr.config) delegates here.
 
-Size model: each preset carries its OWN absolute `reference` table, one 5-point trapezoid
-`{floor, lo, target, hi, ceiling}` entry per resolution, in GiB/h:
-  - floor / ceiling : legitimacy bounds. Outside [floor, ceiling] a release is dropped before
-                      scoring (too small / fake below floor, bloated above ceiling), n_size = 0.
-  - lo .. hi        : the "good size" band; n_size = `size_shoulder` at lo/hi, so inside it score
-                      drives the pick and `target` placement only nudges the preference.
-  - target          : the peak (n_size = 1.0), placed at a per-profile percentile of real sizes.
-
-Scoring is TWO axes (score, size); resolution is a hard guard in decision.py, not a weighted axis.
-The swap rule is a single closeness-gain test (see decision.py): a candidate is taken only if it
-raises TOPSIS closeness by at least `min_closeness_gain`, plus the resolution guard. Closeness is a
-fixed function of the release alone, so the optimizer is provably non-oscillating (every swap
-strictly increases it).
+Size model (relative): there are no per-preset size tables or shapes. Inclusion filters drop the
+obviously-bad (score < 0, score below `current - score_window`, wrong resolution, outside the
+shared per-resolution `size_bounds` legitimacy band, lone-small outliers). The survivors are then
+scored on TWO axes, each min-max normalized OVER THE SURVIVORS (+ the current file): score (higher
+better) and GiB/h (smaller better). A profile's `weights` combine them into a TOPSIS closeness.
+The only per-profile knob is the weights. Oscillation is prevented by one-and-done state (a movie
+is satisfied once its current file is optimal and never re-evaluated), not by a closeness margin.
 """
 
 from __future__ import annotations
@@ -36,66 +29,55 @@ PICK_ORDERS = {
     "release_date_asc",  # oldest release first
     "release_date_desc",  # newest release first
 }
-PICK_METHODS = {"topsis", "max_score", "min_size"}
-
-# resolution -> (floor, lo, target, hi, ceiling) GiB/h. A 5-point trapezoid: n_size is 0 outside
-# [floor, ceiling], rises to `shoulder` at lo, peaks at 1.0 at target, falls back to `shoulder` at
-# hi. The flat-ish [lo, hi] band is the "good size" region where score drives the pick.
-Reference = dict[int, tuple[float, float, float, float, float]]
+# resolution -> (floor, ceiling) GiB/h. Shared legitimacy bounds: below floor = fake/upscale,
+# above ceiling = bloat. A candidate outside its resolution's band is dropped before scoring.
+SizeBounds = dict[int, tuple[float, float]]
 
 
 @dataclass
 class Preset:
-    """A named bundle: TOPSIS weights + a pick method + an absolute size table + swap margin."""
+    """A named bundle: TOPSIS weights + a swap margin. The pick is always max closeness."""
 
     weights: dict[str, float]  # keys: score, size (sum 1.0)
-    pick: str  # "topsis" | "max_score" | "min_size"
-    reference: Reference  # res -> (floor, lo, target, hi, ceiling) GiB/h
-    min_closeness_gain: float  # swap only if closeness improves by at least this
+    min_closeness_gain: float  # ACT only if the pick beats the current file's closeness by this
 
 
 @dataclass
 class ProfileOverride:
-    """Exact-name override: reference a preset, or override its weights / pick / table / margin."""
+    """Exact-name override: reference a preset, or override its weights / margin."""
 
     preset: str | None = None
     weights: dict[str, float] | None = None
-    pick: str | None = None
-    reference: Reference | None = None
     min_closeness_gain: float | None = None
 
 
 @dataclass
 class ResolvedProfile:
-    """Everything the scorer + swap rule need for one profile, after preset + override."""
+    """Everything the scorer + decision need for one profile, after preset + override."""
 
     weights: dict[str, float]
-    pick: str
-    reference: Reference
     min_closeness_gain: float
 
 
 @dataclass
 class TopsisConfig:
-    score_ideal: int
-    score_anti_ideal: int
-    score_gap: float
     default_preset: str
     default_min_closeness_gain: float
     presets: dict[str, Preset]
-    # Score-axis normalization. "logistic" (default) maps raw score through an S-curve centered
-    # at score_center with slope set by score_width, concentrating the [0,1] range where releases
-    # actually cluster. "linear" uses the fixed score_anti_ideal..score_ideal ramp.
-    score_norm: str = "logistic"
-    score_center: float = 825000.0
-    score_width: float = 87500.0
-    # n_size value at the band shoulders (lo/hi). Higher = flatter band = score drives harder
-    # inside it. 1.0 collapses the trapezoid to a hard top-hat.
-    size_shoulder: float = 0.85
+    # Three-tier score window (see topsis._score_floor_tier):
+    #   Tier 1: keep score >= max_available - score_window (anchor at top of what's on offer).
+    #   Tier 2: if fewer than min_candidates survive, expand down to current_file_score.
+    #   Tier 3: if still fewer, expand to max(0, current_file_score - score_window) (full budget).
+    score_window: int = 100000
+    # Minimum pool size used at two gates: (1) the score-window tier check (expand to the next
+    # tier if too few survive the current one); (2) the TOPSIS gate (HOLD without satisfying if
+    # fewer than this many remain after all filters -- relative min-max is untrustworthy too thin).
+    min_candidates: int = 6
     # Outlier prefilter: drop a candidate whose GiB/h is below outlier_frac x the median GiB/h of
-    # the comparable-score (gap-cut) cluster. Encodes "a good release has corroborating peers";
-    # 0 disables it.
+    # the surviving cluster. 0 disables it.
     outlier_frac: float = 0.5
+    # Shared per-resolution {floor, ceiling} legitimacy band (GiB/h).
+    size_bounds: SizeBounds = field(default_factory=dict)
     profiles: dict[str, ProfileOverride] = field(default_factory=dict)
 
 
@@ -107,8 +89,7 @@ class OptimizerAppConfig:
     # If False, releases bigger than the current file are filtered out before scoring —
     # blocks resolution upgrades too (1080p -> 2160p is always a size increase).
     allow_size_increase: bool = True
-    # If False, releases with a lower score than the current file are filtered out before
-    # scoring. NOTE: turning this off neutralizes size-leaning presets (Compact/Efficient).
+    # If False, releases with a lower score than the current file are filtered out before scoring.
     allow_quality_downgrade: bool = True
     # If True, queue items waiting for manual import don't count toward queue_max.
     ignore_completed_in_queue: bool = True
@@ -124,7 +105,6 @@ class OptimizerConfig:
     pick_order: str = "random"
     process_interval_seconds: int = 15
     list_refresh_minutes: int = 15
-    reevaluate_after_days: int = 30
     radarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     sonarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     topsis: TopsisConfig = field(default_factory=lambda: default_topsis())
@@ -144,39 +124,26 @@ def _weights(raw: dict, where: str) -> dict[str, float]:
     return w
 
 
-def _reference(raw: dict, where: str) -> Reference:
-    out: Reference = {}
+def _size_bounds(raw: dict, where: str) -> SizeBounds:
+    out: SizeBounds = {}
     for res, entry in raw.items():
         try:
             res_int = int(res)
         except (TypeError, ValueError) as e:
             raise ValueError(f"{where}: key {res!r} is not an integer resolution") from e
-        need = {"floor", "lo", "target", "hi", "ceiling"}
-        if not isinstance(entry, dict) or not need <= entry.keys():
-            raise ValueError(
-                f"{where}.{res}: expected {{floor, lo, target, hi, ceiling}}, got {entry!r}"
-            )
+        if not isinstance(entry, dict) or not {"floor", "ceiling"} <= entry.keys():
+            raise ValueError(f"{where}.{res}: expected {{floor, ceiling}}, got {entry!r}")
         floor = float(entry["floor"])
-        lo = float(entry["lo"])
-        target = float(entry["target"])
-        hi = float(entry["hi"])
         ceiling = float(entry["ceiling"])
-        if not (floor < lo <= target <= hi < ceiling):
+        if not (0.0 <= floor < ceiling):
             raise ValueError(
-                f"{where}.{res}: must satisfy floor < lo <= target <= hi < ceiling, "
-                f"got floor={floor} lo={lo} target={target} hi={hi} ceiling={ceiling}"
+                f"{where}.{res}: must satisfy 0 <= floor < ceiling, got floor={floor} "
+                f"ceiling={ceiling}"
             )
-        out[res_int] = (floor, lo, target, hi, ceiling)
+        out[res_int] = (floor, ceiling)
     if not out:
-        raise ValueError(f"{where} is empty (a preset must define its size table)")
+        raise ValueError(f"{where} is empty (define at least one resolution's {{floor, ceiling}})")
     return out
-
-
-def _parse_pick(raw: dict, where: str) -> str:
-    pick = str(raw.get("pick", "topsis"))
-    if pick not in PICK_METHODS:
-        raise ValueError(f"{where}.pick={pick!r} not in {sorted(PICK_METHODS)}")
-    return pick
 
 
 def _parse_min_gain(value: float | int, where: str) -> float:
@@ -187,46 +154,31 @@ def _parse_min_gain(value: float | int, where: str) -> float:
 
 
 def _parse_preset(raw: dict, where: str, default_min_gain: float) -> Preset:
-    if "reference" not in raw:
-        raise ValueError(f"{where}: missing required size table [{where}.reference]")
     min_gain = (
         _parse_min_gain(raw["min_closeness_gain"], where)
         if "min_closeness_gain" in raw
         else default_min_gain
     )
-    return Preset(
-        weights=_weights(raw, where),
-        pick=_parse_pick(raw, where),
-        reference=_reference(raw["reference"], f"{where}.reference"),
-        min_closeness_gain=min_gain,
-    )
+    return Preset(weights=_weights(raw, where), min_closeness_gain=min_gain)
 
 
 def _parse_profile_override(raw: dict, where: str) -> ProfileOverride:
     weights = _weights(raw["weights"], f"{where}.weights") if "weights" in raw else None
-    pick = _parse_pick(raw, where) if "pick" in raw else None
-    reference = _reference(raw["reference"], f"{where}.reference") if "reference" in raw else None
     min_gain = (
         _parse_min_gain(raw["min_closeness_gain"], where) if "min_closeness_gain" in raw else None
     )
-    return ProfileOverride(
-        preset=raw.get("preset"),
-        weights=weights,
-        pick=pick,
-        reference=reference,
-        min_closeness_gain=min_gain,
-    )
+    return ProfileOverride(preset=raw.get("preset"), weights=weights, min_closeness_gain=min_gain)
 
 
 def _parse_topsis(raw: dict) -> TopsisConfig:
-    default_min_gain = _parse_min_gain(raw.get("min_closeness_gain", 0.02), "optimizer.topsis")
+    default_min_gain = _parse_min_gain(raw["min_closeness_gain"], "optimizer.topsis")
     presets = {
         name: _parse_preset(p, f"presets.{name}", default_min_gain)
-        for name, p in raw.get("presets", {}).items()
+        for name, p in raw["presets"].items()
     }
     if not presets:
         raise ValueError("optimizer.topsis.presets is empty (defaults.toml should define them)")
-    default_preset = str(raw.get("default_preset", "Balanced"))
+    default_preset = str(raw["default_preset"])
     if default_preset not in presets:
         raise ValueError(f"default_preset {default_preset!r} is not a defined preset")
     profiles = {
@@ -236,32 +188,27 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
     for name, ov in profiles.items():
         if ov.preset is not None and ov.preset not in presets:
             raise ValueError(f"profiles.{name}.preset {ov.preset!r} is not a defined preset")
-    score_norm = str(raw.get("score_norm", "logistic"))
-    if score_norm not in {"logistic", "linear"}:
-        raise ValueError(
-            f"optimizer.topsis.score_norm must be 'logistic' or 'linear', got {score_norm!r}"
-        )
-    score_width = float(raw.get("score_width", 85000))
-    if score_width <= 0:
-        raise ValueError(f"optimizer.topsis.score_width must be > 0, got {score_width}")
-    size_shoulder = float(raw.get("size_shoulder", 0.85))
-    if not (0.0 <= size_shoulder <= 1.0):
-        raise ValueError(f"optimizer.topsis.size_shoulder must be in [0, 1], got {size_shoulder}")
-    outlier_frac = float(raw.get("outlier_frac", 0.5))
+    score_window = int(raw["score_window"])
+    if score_window < 0:
+        raise ValueError(f"optimizer.topsis.score_window must be >= 0, got {score_window}")
+    min_candidates = int(raw["min_candidates"])
+    if min_candidates < 1:
+        raise ValueError(f"optimizer.topsis.min_candidates must be >= 1, got {min_candidates}")
+    outlier_frac = float(raw["outlier_frac"])
     if not (0.0 <= outlier_frac < 1.0):
         raise ValueError(f"optimizer.topsis.outlier_frac must be in [0, 1), got {outlier_frac}")
+    if "size_bounds" not in raw:
+        raise ValueError(
+            "optimizer.topsis.size_bounds is required (per-resolution {floor, ceiling})"
+        )
     return TopsisConfig(
-        score_ideal=int(raw["score_ideal"]),
-        score_anti_ideal=int(raw["score_anti_ideal"]),
-        score_gap=float(raw["score_gap"]),
         default_preset=default_preset,
         default_min_closeness_gain=default_min_gain,
         presets=presets,
-        score_norm=score_norm,
-        score_center=float(raw.get("score_center", 805000)),
-        score_width=score_width,
-        size_shoulder=size_shoulder,
+        score_window=score_window,
+        min_candidates=min_candidates,
         outlier_frac=outlier_frac,
+        size_bounds=_size_bounds(raw["size_bounds"], "optimizer.topsis.size_bounds"),
         profiles=profiles,
     )
 
@@ -283,55 +230,39 @@ def _parse_release_types(raw: object, allowed: set[str], where: str) -> list[str
     return out
 
 
-def _parse_optimizer_app(
-    raw: dict, default_release_type: list[str], allowed: set[str], where: str
-) -> OptimizerAppConfig:
-    release_type = _parse_release_types(
-        raw.get("release_type", default_release_type), allowed, where
-    )
+def _parse_optimizer_app(raw: dict, allowed: set[str], where: str) -> OptimizerAppConfig:
     return OptimizerAppConfig(
-        enabled=bool(raw.get("enabled", True)),
-        min_age_days=int(raw.get("min_age_days", 0)),
-        release_type=release_type,
-        allow_size_increase=bool(raw.get("allow_size_increase", True)),
-        allow_quality_downgrade=bool(raw.get("allow_quality_downgrade", True)),
-        ignore_completed_in_queue=bool(raw.get("ignore_completed_in_queue", True)),
-        auto_import_downgrades=bool(raw.get("auto_import_downgrades", True)),
+        enabled=bool(raw["enabled"]),
+        min_age_days=int(raw["min_age_days"]),
+        release_type=_parse_release_types(raw["release_type"], allowed, where),
+        allow_size_increase=bool(raw["allow_size_increase"]),
+        allow_quality_downgrade=bool(raw["allow_quality_downgrade"]),
+        ignore_completed_in_queue=bool(raw["ignore_completed_in_queue"]),
+        auto_import_downgrades=bool(raw["auto_import_downgrades"]),
     )
 
 
 def parse_optimizer(raw: dict) -> OptimizerConfig:
-    pick_order = str(raw.get("pick_order", "random")).strip()
+    pick_order = str(raw["pick_order"]).strip()
     if pick_order not in PICK_ORDERS:
         raise ValueError(f"optimizer.pick_order={pick_order!r} not in {sorted(PICK_ORDERS)}")
 
-    process_interval_seconds = int(raw.get("process_interval_seconds", 15))
+    process_interval_seconds = int(raw["process_interval_seconds"])
     if process_interval_seconds < 10:
         raise ValueError(
             f"optimizer.process_interval_seconds must be >= 10, got {process_interval_seconds}"
         )
 
     return OptimizerConfig(
-        enabled=bool(raw.get("enabled", False)),
-        queue_max=int(raw.get("queue_max", 5)),
-        import_max=int(raw.get("import_max", 2)),
+        enabled=bool(raw["enabled"]),
+        queue_max=int(raw["queue_max"]),
+        import_max=int(raw["import_max"]),
         pick_order=pick_order,
         process_interval_seconds=process_interval_seconds,
-        list_refresh_minutes=int(raw.get("list_refresh_minutes", 15)),
-        reevaluate_after_days=int(raw.get("reevaluate_after_days", 30)),
-        radarr=_parse_optimizer_app(
-            raw.get("radarr", {}),
-            ["digitalRelease", "dateAdded"],
-            RADARR_RELEASE_TYPES,
-            "optimizer.radarr",
-        ),
-        sonarr=_parse_optimizer_app(
-            raw.get("sonarr", {}),
-            ["airDateUtc", "dateAdded"],
-            SONARR_RELEASE_TYPES,
-            "optimizer.sonarr",
-        ),
-        topsis=_parse_topsis(raw.get("topsis", {})),
+        list_refresh_minutes=int(raw["list_refresh_minutes"]),
+        radarr=_parse_optimizer_app(raw["radarr"], RADARR_RELEASE_TYPES, "optimizer.radarr"),
+        sonarr=_parse_optimizer_app(raw["sonarr"], SONARR_RELEASE_TYPES, "optimizer.sonarr"),
+        topsis=_parse_topsis(raw["topsis"]),
     )
 
 

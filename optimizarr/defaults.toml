@@ -32,11 +32,11 @@ require_cutoff_met = true
 [optimizer]
 enabled = true
 # Only grab when the download queue has <= queue_max actively-downloading items (0 = empty only).
-queue_max = 5
+queue_max = 0
 # Pause grabbing while more than import_max completed downloads are waiting to import
 # (importPending) or importing, so the import backlog drains first. importBlocked (manual-only) is
 # not counted, so a stuck manual item can't freeze grabs forever.
-import_max = 2
+import_max = 1
 # Order the worker walks the library each pass. This only changes which items are improved FIRST,
 # never the per-item decision (so it never changes WHAT gets grabbed, only the order it happens):
 #   random             shuffle each pass (default)
@@ -47,11 +47,12 @@ import_max = 2
 pick_order = "random"
 # Short loop: seconds between processing items. Also the wait when the queue is full or the list
 # is exhausted, and the settle delay so a grab surfaces in the queue before the next read. Min 10.
-process_interval_seconds = 15
+process_interval_seconds = 300
 # Long loop: how often to re-fetch the full library list from Radarr/Sonarr.
 list_refresh_minutes = 15
-# A satisfied item (HOLD: nothing better found) is reconsidered this many days later.
-reevaluate_after_days = 30
+# One-and-done: a movie satisfied for its profile is never re-evaluated automatically. It becomes
+# eligible again only if its profile changes or its file is removed; to force a full re-run, delete
+# (or edit) the state.json. There is no time-based re-evaluation.
 
 # Per-app:
 #   enabled                    toggle this app from the optimizer.
@@ -92,121 +93,77 @@ ignore_completed_in_queue = true
 auto_import_downgrades = true
 
 # ===== TOPSIS =====
+# Relative two-axis model. There are no per-preset size tables or shapes. For each movie:
+#   1. FILTER the obviously bad: drop negatives, apply three-tier score window (see below), keep
+#      only the profile's target resolution, drop outside the shared [floor, ceiling] band,
+#      drop lone-small outliers.
+#   2. SCORE: min-max normalize the survivors (plus the current file) on two axes -- score (higher
+#      better) and GiB/h (smaller better) -- then combine with the profile's weights into a TOPSIS
+#      closeness. ACT if the best candidate's closeness beats the current file's; else HOLD.
+# The only per-profile knob is the weights. score down + size up vs the current file is impossible
+# (a worse-on-both pick has lower closeness than the current file, so it is never grabbed).
 [optimizer.topsis]
-# Score-axis normalization: how a raw customFormatScore becomes the [0,1] "score" attribute.
-#   logistic (default): S-curve, n_score = 1 / (1 + exp(-(score - score_center) / score_width)).
-#     Profilarr scores bunch tightly near the top (a "perfect" release is ~1,000,000 but real
-#     releases top out lower and cluster there) and fall off fast below. A logistic puts the
-#     axis's resolution where releases actually compete, so a small real score difference at the
-#     top is not drowned out by the size axis; and there is no hard cutoff, so a library whose
-#     scores all sit near one value is still spread out. Defaults are fit to observed release scores.
-#   linear: the old fixed ramp over [score_anti_ideal, score_ideal]. Kept for simple setups.
-score_norm = "logistic"
-score_center = 825000   # score that maps to n_score = 0.5 (fit to real post-prefilter candidates)
-score_width = 87500     # slope; roughly the spread of the competitive score cluster (bigger = gentler)
-# Used only when score_norm = "linear":
-score_ideal = 1000000
-score_anti_ideal = 0
-# gap-cut inclusion: keep the top score cluster down to the first relative drop greater than this.
-score_gap = 0.20
-# n_size value at the band shoulders (lo/hi). Higher = flatter "good size" band, so score drives
-# harder inside it; lower = more pull toward the exact target. 1.0 = a hard top-hat band.
-size_shoulder = 0.85
+# Score window uses three tiers (tried in order, stopping at the first with enough candidates):
+#   Tier 1 -- anchor at top:     floor = max_available_score - score_window (favors quality)
+#   Tier 2 -- expand to current: floor = current_file_score (pulls in releases at/above the bar)
+#   Tier 3 -- full budget:       floor = max(0, current_file_score - score_window) (last resort)
+score_window = 100000
+# Minimum pool size used at two gates:
+#   1. Score-window tier: expand to the next tier if fewer than this survive the current one.
+#   2. TOPSIS gate: HOLD without satisfying if fewer than this remain after ALL filters (relative
+#      min-max over a tiny pool is unreliable). The movie is retried when more releases appear.
+min_candidates = 5
 # Outlier drop: discard a candidate whose GiB/h is below outlier_frac x the median GiB/h of the
-# comparable-score (gap-cut) cluster -- a lone tiny release among bigger ones is usually a bad
-# encode. "A good encode has corroborating peers." 0 disables it.
+# surviving cluster. This is the key guard against over-compressed / upscale "2160p" junk that
+# Profilarr still scores high on format tags (a real 2160p HEVC is ~4-8 GiB/h; junk is < 2). Without
+# it, ~half of picks were such tiny files. 0 disables it; lower it (e.g. 0.4) to keep more lean
+# encodes, raise it for stricter junk rejection.
 outlier_frac = 0.5
 # Preset used when a profile name matches no preset by keyword.
 default_preset = "Balanced"
-# Swap margin: a candidate is grabbed only if it raises TOPSIS closeness by at least this much
-# (per-preset overridable). Any positive value guarantees the optimizer cannot oscillate, since
-# closeness is computed from the release alone and therefore strictly increases on every swap.
+# ACT margin: grab the best candidate only if its closeness beats the current file's by at least
+# this. Hysteresis to avoid churning on a negligible improvement.
 min_closeness_gain = 0.02
 
-# ----- Presets -----
-# Each preset = TOPSIS weights (score + size, sum 1.0) + a `pick` method (topsis | max_score |
-# min_size) + its OWN absolute size table [.reference] + an optional `min_closeness_gain`. Profiles
-# attach to a preset whose name is a (case-insensitive) substring of the profile name; e.g.
-# "2160p Quality" -> Quality, "2160p Remux" -> Remux. Add presets freely. (Resolution is no longer
-# a scored axis -- Profilarr folds it into the score, and a hard guard in decision.py forbids
-# dropping below the profile target, so the two axes are score and size.)
-#
-# The size table is a per-resolution 5-point trapezoid `{floor, lo, target, hi, ceiling}` in GiB/h:
-#   - floor / ceiling : the legitimacy bounds. Outside [floor, ceiling] a release is dropped before
-#                       scoring (too soft / fake below floor, bloated above ceiling) and n_size = 0.
-#   - lo .. hi         : the "good size" band. n_size = `size_shoulder` at lo/hi, so inside the band
-#                        size barely moves the pick and SCORE drives it.
-#   - target           : the peak (n_size = 1.0). Placed at a percentile of real release sizes per
-#                        profile (Compact ~P10, Efficient ~P30, Balanced ~P50, Quality ~P77, Remux
-#                        remux-range). Nudge a profile by sliding target within [lo, hi].
-# Each profile aims at a different size band, so they pick DIFFERENT releases. A too-small file now
-# scores low on the size axis, BUT a bigger file is only ever grabbed on a genuine score upgrade:
-# decision.py forbids "bigger and lower-or-equal score", so the band preference can never degrade
-# into "drop the score to inflate the file". The swap rule also requires a closeness gain
-# >= min_closeness_gain and never drops resolution below the profile target.
+# Shared per-resolution legitimacy band {floor, ceiling} in GiB/h (GB = 1024^3). Below floor =
+# fake/upscale, above ceiling = bloat; outside it a release is dropped before scoring. Wide on
+# purpose: the relative scoring, not a hard band, expresses each profile's taste. (~P1 / P99 of
+# real release sizes per resolution.)
+[optimizer.topsis.size_bounds]
+"2160" = { floor = 3,  ceiling = 30 }
+"1080" = { floor = 1, ceiling = 15 }
+"720"  = { floor = 0.5, ceiling = 7.5 }
+"480"  = { floor = 0.10, ceiling = 5 }
 
+# ----- Presets -----
+# Each preset = TOPSIS weights (score + size, sum 1.0) + an optional per-preset `min_closeness_gain`.
+# The pick is always the highest-closeness candidate. Profiles attach to a preset whose name
+# is a (case-insensitive) substring of the profile name; e.g. "2160p Quality" -> Quality. A high
+# size weight (Compact) trades score for the smallest file; a high score weight (Remux) takes the
+# best score and barely cares about size. Resolution is not a scored axis (Profilarr folds it into
+# the score, and the target-resolution filter handles it).
 [optimizer.topsis.presets.Remux]
-# Untouched UHD/BluRay remux: score is nearly everything; the band sits at remux bitrates (no remux
-# releases in the training sample, so these are hand-set, not data-derived).
-score = 0.94
-size = 0.06
-pick = "topsis"
-[optimizer.topsis.presets.Remux.reference]
-"2160" = { floor = 15.0, lo = 28.0, target = 38.0, hi = 60.0, ceiling = 90.0 }
-"1080" = { floor = 8.0,  lo = 15.0, target = 20.0, hi = 32.0, ceiling = 48.0 }
-"720"  = { floor = 2.0,  lo = 4.0,  target = 5.5,  hi = 9.0,  ceiling = 14.0 }
-"480"  = { floor = 0.5,  lo = 1.2,  target = 1.8,  hi = 3.0,  ceiling = 5.0 }
+score = 0.90
+size = 0.10
 
 [optimizer.topsis.presets.Quality]
-# Score-first, aims high in the encode range (~P77). High floor rejects suspiciously-small encodes;
-# high ceiling keeps legitimately-big high-score files (e.g. a grain-heavy 2160p that runs hot).
-score = 0.86
-size = 0.14
-pick = "topsis"
-[optimizer.topsis.presets.Quality.reference]
-"2160" = { floor = 6.5, lo = 10.7, target = 11.5, hi = 13.5, ceiling = 30.0 }
-"1080" = { floor = 3.0, lo = 5.0,  target = 6.3,  hi = 8.7,  ceiling = 16.0 }
-"720"  = { floor = 1.2, lo = 2.0,  target = 2.6,  hi = 3.5,  ceiling = 7.0 }
-"480"  = { floor = 0.5, lo = 0.9,  target = 1.1,  hi = 1.5,  ceiling = 3.5 }
+score = 0.75
+size = 0.25
 
 [optimizer.topsis.presets.Balanced]
-# Good score AND a sensible size: target = the median real encode (~P50).
-score = 0.56
-size = 0.44
-pick = "topsis"
-[optimizer.topsis.presets.Balanced.reference]
-"2160" = { floor = 5.0, lo = 8.1, target = 9.3, hi = 11.0, ceiling = 20.0 }
-"1080" = { floor = 2.0, lo = 3.8, target = 4.5, hi = 5.3,  ceiling = 10.0 }
-"720"  = { floor = 0.8, lo = 1.5, target = 1.8, hi = 2.2,  ceiling = 4.5 }
-"480"  = { floor = 0.3, lo = 0.6, target = 0.7, hi = 0.9,  ceiling = 2.5 }
+score = 0.50
+size = 0.50
 
 [optimizer.topsis.presets.Efficient]
-# Lean but legitimate: target around the lower-quartile encode (~P30), not the smallest.
-score = 0.44
-size = 0.56
-pick = "topsis"
-[optimizer.topsis.presets.Efficient.reference]
-"2160" = { floor = 4.0, lo = 7.1, target = 7.8, hi = 8.8, ceiling = 15.0 }
-"1080" = { floor = 1.5, lo = 2.8, target = 3.5, hi = 4.3, ceiling = 7.5 }
-"720"  = { floor = 0.6, lo = 1.1, target = 1.4, hi = 1.7, ceiling = 3.5 }
-"480"  = { floor = 0.25, lo = 0.45, target = 0.55, hi = 0.7, ceiling = 2.0 }
+score = 0.40
+size = 0.60
 
 [optimizer.topsis.presets.Compact]
-# Smallest viable, but NOT the absolute smallest: target near the bottom decile (~P10), with the
-# floor still rejecting outright fakes/bad encodes below it.
-score = 0.22
-size = 0.78
-pick = "topsis"
-[optimizer.topsis.presets.Compact.reference]
-"2160" = { floor = 3.5, lo = 5.9, target = 6.8, hi = 7.6, ceiling = 12.0 }
-"1080" = { floor = 1.2, lo = 1.9, target = 2.6, hi = 3.2, ceiling = 6.0 }
-"720"  = { floor = 0.4, lo = 0.8, target = 1.0, hi = 1.3, ceiling = 3.0 }
-"480"  = { floor = 0.2, lo = 0.35, target = 0.45, hi = 0.6, ceiling = 2.0 }
+score = 0.25
+size = 0.75
 
-# Per-profile-name overrides. Reference a preset, or override weights / pick / reference / margin:
+# Per-profile-name overrides. Reference a preset, or override weights / pick / margin:
 # [optimizer.topsis.profiles."2160p Remux"]
 # preset = "Remux"
 # [optimizer.topsis.profiles."My Custom 1080p"]
 # weights = { score = 0.6, size = 0.4 }
-# [optimizer.topsis.profiles."My Custom 1080p".reference]
-# "1080" = { floor = 1.5, lo = 3.5, target = 4.0, hi = 5.0, ceiling = 9.0 }

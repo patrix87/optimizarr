@@ -226,15 +226,24 @@ class OptimizerWorker:
 
     def _refresh(self, ctx: _AppContext, now: datetime) -> None:
         adapter = ctx.adapter
-        adapter.refresh_profiles()
-        # Select on hasFile alone (not monitored): the optimizer improves the existing
-        # library, and the unmonitor feature deliberately strips monitoring once a file
-        # exists. The age gate is the optimizer's own min_age_days.
-        items = [
-            it
-            for it in adapter.list_items()
-            if adapter.has_file(it) and age_ok(adapter, it, ctx.app_cfg, now)
-        ]
+        # Safe reconciliation: a failed or interrupted library fetch must NEVER clear the known
+        # item set (and we never prune state from the list anyway). On error, keep the previous
+        # items_by_id and retry on the next tick (last_refresh is left unchanged).
+        try:
+            adapter.refresh_profiles()
+            # Select on hasFile alone (not monitored): the optimizer improves the existing
+            # library, and the unmonitor feature deliberately strips monitoring once a file
+            # exists. The age gate is the optimizer's own min_age_days.
+            items = [
+                it
+                for it in adapter.list_items()
+                if adapter.has_file(it) and age_ok(adapter, it, ctx.app_cfg, now)
+            ]
+        except Exception:
+            logger.exception(
+                "[%s] library refresh failed; keeping the previous item set", adapter.app
+            )
+            return
         ctx.items_by_id = {adapter.item_id(it): it for it in items}
         # NB: ctx.evaluated is intentionally NOT cleared here. A refresh only updates the
         # candidate set (new items become pickable, removed ones drop); the current pass
@@ -243,17 +252,19 @@ class OptimizerWorker:
         ctx.last_refresh = now
         logger.info("[%s] list refreshed: %d items with files", adapter.app, len(items))
 
-    def _build_pool(self, ctx: _AppContext, now: datetime) -> None:
-        days = self.opt.reevaluate_after_days
+    def _build_pool(self, ctx: _AppContext) -> None:
         app = ctx.adapter.app
+        adapter = ctx.adapter
 
         def active(exclude_evaluated: bool) -> list[int]:
-            return [
-                item_id
-                for item_id in ctx.items_by_id
-                if self.state.is_active(app, item_id, now, days)
-                and not (exclude_evaluated and item_id in ctx.evaluated)
-            ]
+            out: list[int] = []
+            for item_id, item in ctx.items_by_id.items():
+                if exclude_evaluated and item_id in ctx.evaluated:
+                    continue
+                profile_name, _target_res = adapter.profile_for(item)
+                if self.state.is_active(app, item_id, profile_name, adapter.has_file(item)):
+                    out.append(item_id)
+            return out
 
         ctx.pool = active(exclude_evaluated=True)
         if not ctx.pool and ctx.evaluated:
@@ -285,9 +296,10 @@ class OptimizerWorker:
         logger.info("%s", format_decision(adapter.app, label, decision, self.dry_run))
 
         if decision.action == "HOLD":
-            # Nothing better (incl. no viable release): drop it from the pool.
-            if not self.dry_run:
-                self.state.mark_satisfied(adapter.app, item_id)
+            # Satisfy (permanently) ONLY when the current imported file is optimal for its profile.
+            # An insufficient-candidates HOLD (decision.satisfy=False) is left in the pool to retry.
+            if decision.satisfy and not self.dry_run:
+                self.state.mark_satisfied(adapter.app, item_id, profile_name)
             return
 
         # ACT: grab, but do NOT record anything. If the download succeeds, the next
@@ -462,7 +474,7 @@ class OptimizerWorker:
         import_count = sum(1 for r in records if adapter.is_queue_item_pending_import(r))
 
         if not ctx.pool:
-            self._build_pool(ctx, now)
+            self._build_pool(ctx)
         if not ctx.pool:
             return False
 

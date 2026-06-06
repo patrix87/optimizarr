@@ -229,6 +229,9 @@ class _ProcessAdapter(ArrApi):
     def profile_for(self, item):
         return ("2160p Quality", 2160)
 
+    def has_file(self, item):
+        return True
+
     def current_file(self, item):
         return self._current
 
@@ -249,7 +252,9 @@ def _worker(state, dry_run=False):
     w = OptimizerWorker.__new__(OptimizerWorker)
     w.opt = OptimizerConfig(enabled=True)
     w.state = state
-    w.topsis = Topsis(default_topsis())
+    cfg = default_topsis()
+    cfg.min_candidates = 2  # worker tests use 2-candidate pools; pool-size tested in test_topsis
+    w.topsis = Topsis(cfg)
     w.dry_run = dry_run
     return w
 
@@ -264,12 +269,15 @@ def test_process_one_hold_marks_satisfied(tmp_path):
     # Current file is already excellent; the candidate is no better -> HOLD -> satisfied.
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=900_000, resolution=2160, size_gb=28.0),  # clearly worse
+        ],
         current_file=_file(score=1_000_000, resolution=2160, size_gb=14.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
     entry = state.get("radarr", 1)
-    assert entry is not None and entry.status == SATISFIED
+    assert entry is not None and entry.status == SATISFIED and entry.profile == "2160p Quality"
     assert adapter.grabbed == []
 
 
@@ -278,7 +286,10 @@ def test_process_one_act_grabs_without_marking(tmp_path):
     # pool until a later evaluation HOLDs (success) or it's retried (failure).
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=950_000, resolution=2160, size_gb=18.0),
+        ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
@@ -382,7 +393,10 @@ def test_importblocked_does_not_count_toward_import_gate(tmp_path):
     ]
     adapter = _GrabQueueAdapter(
         records,
-        releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
+        releases=[
+            _release(score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(score=950_000, resolution=2160, size_gb=18.0),
+        ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
@@ -422,19 +436,18 @@ def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     w = _worker(state)
     ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}, 3: {"id": 3}}
-    now = datetime.now(UTC)
 
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert set(ctx.pool) == {1, 2, 3}
 
     # Two items processed this pass; a refresh happened (evaluated preserved).
     ctx.evaluated = {1, 2}
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert ctx.pool == [3]  # only the unvisited item remains
 
     # Last item visited -> pool empties -> pass resets to a fresh full sweep.
     ctx.evaluated = {1, 2, 3}
-    w._build_pool(ctx, now)
+    w._build_pool(ctx)
     assert set(ctx.pool) == {1, 2, 3}
     assert ctx.evaluated == set()
 
@@ -788,9 +801,9 @@ def test_queue_active_filter_excludes_completed_when_flag_on():
 
 def test_build_pool_excludes_satisfied(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
-    state.mark_satisfied("radarr", 2)
+    state.mark_satisfied("radarr", 2, "2160p Quality")  # same profile the adapter reports
     w = _worker(state)
     ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}}
-    w._build_pool(ctx, datetime.now(UTC))
-    assert ctx.pool == [1]  # satisfied item 2 is out of the pool
+    w._build_pool(ctx)
+    assert ctx.pool == [1]  # satisfied item 2 (same profile, has file) is out of the pool
