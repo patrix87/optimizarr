@@ -363,6 +363,15 @@ def test_schedule_defaults_all_days(monkeypatch, tmp_path):
         assert window.end == time(8, 0)
 
 
+def test_schedule_enabled_false_always_active(monkeypatch, tmp_path):
+    # enabled = false clears all day entries -> always active (no restriction).
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+    path = _write(tmp_path, "[optimizer.schedule]\nenabled = false\n")
+    cfg = load_config(path)
+    assert cfg.optimizer.schedule == {}  # empty = always active
+
+
 def test_rejects_invalid_schedule_time(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")

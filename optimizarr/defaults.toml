@@ -98,6 +98,7 @@ auto_import_downgrades = true
 # A window where start >= end crosses midnight (e.g. 23:00 to 08:00 is active from 23:00 that
 # day until 08:00 the next day). Omit a day or the whole block to be always active on that day.
 [optimizer.schedule]
+enabled   = true              # set to false to run 24/7 with no active-hours restriction
 sunday    = { start = "23:00", end = "08:00" }
 monday    = { start = "23:00", end = "08:00" }
 tuesday   = { start = "23:00", end = "08:00" }

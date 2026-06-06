@@ -274,8 +274,12 @@ def _parse_time(s: str, where: str) -> time:
 
 
 def _parse_schedule(raw: dict, where: str) -> dict[int, ScheduleWindow]:
+    if not raw.get("enabled", True):
+        return {}  # empty schedule = always active (no restriction)
     out: dict[int, ScheduleWindow] = {}
     for day, entry in raw.items():
+        if day == "enabled":
+            continue
         wd = _DAY_TO_WEEKDAY.get(str(day).lower())
         if wd is None:
             raise ValueError(
