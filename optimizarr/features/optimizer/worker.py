@@ -260,8 +260,9 @@ class OptimizerWorker:
         schedule = self.opt.schedule
         if not schedule:
             return True
-        t = (now_local or datetime.now()).time()
-        today = (now_local or datetime.now()).weekday()  # 0=Mon, 6=Sun
+        now_local = now_local or datetime.now()
+        t = now_local.time()
+        today = now_local.weekday()  # 0=Mon, 6=Sun
         yesterday = (today - 1) % 7
 
         if today in schedule:

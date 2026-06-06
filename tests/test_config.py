@@ -336,6 +336,7 @@ def test_parses_schedule(monkeypatch, tmp_path):
         tmp_path,
         """
         [optimizer.schedule]
+        enabled   = true
         monday    = { start = "22:30", end = "07:00" }
         saturday  = { start = "23:00", end = "09:00" }
         """,
@@ -350,17 +351,12 @@ def test_parses_schedule(monkeypatch, tmp_path):
     assert sch[5].start == time(23, 0) and sch[5].end == time(9, 0)
 
 
-def test_schedule_defaults_all_days(monkeypatch, tmp_path):
-    # Built-in defaults define a 23:00-08:00 window for all 7 days.
+def test_schedule_disabled_by_default(monkeypatch, tmp_path):
+    # Schedule is opt-in: enabled = false in defaults means the optimizer runs 24/7 out of the box.
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
     cfg = load_config(_write(tmp_path, ""))
-    assert len(cfg.optimizer.schedule) == 7
-    from datetime import time
-
-    for window in cfg.optimizer.schedule.values():
-        assert window.start == time(23, 0)
-        assert window.end == time(8, 0)
+    assert cfg.optimizer.schedule == {}  # empty = always active
 
 
 def test_schedule_enabled_false_always_active(monkeypatch, tmp_path):
@@ -375,7 +371,10 @@ def test_schedule_enabled_false_always_active(monkeypatch, tmp_path):
 def test_rejects_invalid_schedule_time(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
-    path = _write(tmp_path, '[optimizer.schedule]\nmonday = { start = "25:00", end = "08:00" }\n')
+    path = _write(
+        tmp_path,
+        '[optimizer.schedule]\nenabled = true\nmonday = { start = "25:00", end = "08:00" }\n',
+    )
     with pytest.raises((ValueError, Exception)):
         load_config(path)
 
@@ -383,7 +382,10 @@ def test_rejects_invalid_schedule_time(monkeypatch, tmp_path):
 def test_rejects_unknown_schedule_day(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
-    path = _write(tmp_path, '[optimizer.schedule]\nfunday = { start = "23:00", end = "08:00" }\n')
+    path = _write(
+        tmp_path,
+        '[optimizer.schedule]\nenabled = true\nfunday = { start = "23:00", end = "08:00" }\n',
+    )
     with pytest.raises(ValueError, match="unknown day"):
         load_config(path)
 
