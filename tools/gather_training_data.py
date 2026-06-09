@@ -14,7 +14,7 @@ Run (from the repo root):
 
     uv run --env-file .env python tools/gather_training_data.py --config config.toml --count 100
 
-Then derive stats with tools/training_stats.py.
+Then analyze the result with tools/diagnose.py (--in reports/training_data_<app>.jsonl).
 
 Options:
     --config PATH   config.toml (default: config.toml). Connection/secrets come from env (.env).
@@ -37,7 +37,7 @@ from pathlib import Path
 
 from optimizarr.arr import ArrApi, build_client
 from optimizarr.config import load_config
-from optimizarr.features.optimizer.topsis import GB, Topsis, _release_gbh, _release_resolution
+from optimizarr.features.optimizer.topsis import GB, _release_gbh, _release_resolution
 
 
 def _release_row(r: dict, runtime_h: float) -> dict:
@@ -66,7 +66,7 @@ def _release_row(r: dict, runtime_h: float) -> dict:
     }
 
 
-def _current_row(topsis: Topsis, current_file: dict | None, runtime_h: float) -> dict | None:
+def _current_row(current_file: dict | None, runtime_h: float) -> dict | None:
     """RAW fields for the existing library file (the baseline for size growth/shrink)."""
     if not current_file:
         return None
@@ -75,7 +75,7 @@ def _current_row(topsis: Topsis, current_file: dict | None, runtime_h: float) ->
     gbh = (size_gb / runtime_h) if runtime_h and runtime_h > 0 else 0.0
     return {
         "score": current_file.get("customFormatScore"),
-        "resolution": topsis._current_resolution(current_file),
+        "resolution": _release_resolution(current_file),
         "size_bytes": size,
         "size_gb": round(size_gb, 4),
         "gbh": round(gbh, 4),
@@ -97,7 +97,7 @@ def _existing_ids(out: Path) -> set[int]:
     return ids
 
 
-def collect(api: ArrApi, item: dict, topsis: Topsis) -> dict:
+def collect(api: ArrApi, item: dict) -> dict:
     runtime_h = api.runtime_h(item)
     profile_name, target_res = api.profile_for(item)
     releases = api.releases(item)
@@ -109,7 +109,7 @@ def collect(api: ArrApi, item: dict, topsis: Topsis) -> dict:
         "runtime_h": round(runtime_h, 4),
         # The target profile drives scoring, so it is part of every record.
         "profile": {"name": profile_name, "target_resolution": target_res},
-        "current_file": _current_row(topsis, api.current_file(item), runtime_h),
+        "current_file": _current_row(api.current_file(item), runtime_h),
         "release_count": len(releases),
         "releases": [_release_row(r, runtime_h) for r in releases],
         "collected_at": datetime.now().isoformat(timespec="seconds"),
@@ -131,7 +131,6 @@ def main() -> None:
     conn = getattr(config, args.app)
     if conn is None:
         raise SystemExit(f"{args.app} is not configured in the environment")
-    topsis = Topsis(config.optimizer.topsis)
     api = build_client(args.app, conn)
     api.refresh_profiles()
 
@@ -154,7 +153,7 @@ def main() -> None:
             label = api.label(item)
             print(f"[{args.app}] ({i}/{len(todo)}) searching releases for {label} ...")
             try:
-                record = collect(api, item, topsis)
+                record = collect(api, item)
             except Exception as e:  # noqa: BLE001 - one bad item shouldn't kill a long run
                 print(f"  [warn] {label}: {e}; skipping")
                 continue

@@ -148,8 +148,9 @@ uv run --env-file .env python -m optimizarr
 ```
 
 Set `dry_run = true` in `config.toml` first to log would-be actions without writing anything (no
-grabs, no unmonitors, no state changes). `tools/weight_lab.py` renders how each profile scores and
-picks on sample releases.
+grabs, no unmonitors, no state changes). To inspect scoring offline, gather a real library sample
+with `tools/gather_training_data.py` and run the engine over it with `tools/diagnose.py`, which
+reports the pick quadrants, total size shift, and per-candidate scoring.
 
 ## Releasing
 
