@@ -102,6 +102,20 @@ class OptimizerAppConfig:
 
 
 @dataclass
+class RetryConfig:
+    """Insufficient-candidate retry handling (the 'too few candidates to compare' HOLD).
+
+    An item that survives too few candidates is retried each pass, counting attempts. After
+    max_tries it enters a cooldown_days rest before being re-evaluated fresh (the counter resets).
+    Exception: a current file already scoring satisfied_score is good enough on its own, so the
+    item is marked satisfied immediately instead of being retried."""
+
+    max_tries: int = 3
+    cooldown_days: int = 30
+    satisfied_score: int = 800000
+
+
+@dataclass
 class ScheduleWindow:
     """One day's active window in local time. start >= end means the window crosses midnight."""
 
@@ -120,6 +134,7 @@ class OptimizerConfig:
     radarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     sonarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     topsis: TopsisConfig = field(default_factory=lambda: default_topsis())
+    retry: RetryConfig = field(default_factory=RetryConfig)
     # Per-day active-hours schedule (weekday int -> window, 0=Monday 6=Sunday).
     # Empty dict means always active. Evaluation and list refresh are skipped outside the window;
     # queue import processing always continues.
@@ -225,6 +240,21 @@ def _parse_topsis(raw: dict) -> TopsisConfig:
     )
 
 
+def _parse_retry(raw: dict) -> RetryConfig:
+    max_tries = int(raw["max_tries"])
+    if max_tries < 1:
+        raise ValueError(f"optimizer.retry.max_tries must be >= 1, got {max_tries}")
+    cooldown_days = int(raw["cooldown_days"])
+    if cooldown_days < 0:
+        raise ValueError(f"optimizer.retry.cooldown_days must be >= 0, got {cooldown_days}")
+    satisfied_score = int(raw["satisfied_score"])
+    if satisfied_score < 0:
+        raise ValueError(f"optimizer.retry.satisfied_score must be >= 0, got {satisfied_score}")
+    return RetryConfig(
+        max_tries=max_tries, cooldown_days=cooldown_days, satisfied_score=satisfied_score
+    )
+
+
 def _parse_release_types(raw: object, allowed: set[str], where: str) -> list[str]:
     if isinstance(raw, str):
         raise ValueError(
@@ -315,6 +345,7 @@ def parse_optimizer(raw: dict) -> OptimizerConfig:
         radarr=_parse_optimizer_app(raw["radarr"], RADARR_RELEASE_TYPES, "optimizer.radarr"),
         sonarr=_parse_optimizer_app(raw["sonarr"], SONARR_RELEASE_TYPES, "optimizer.sonarr"),
         topsis=_parse_topsis(raw["topsis"]),
+        retry=_parse_retry(raw["retry"]),
         schedule=_parse_schedule(raw.get("schedule", {}), "optimizer.schedule"),
     )
 

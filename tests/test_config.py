@@ -329,6 +329,31 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     assert t.default_preset in t.presets
 
 
+def test_retry_defaults_and_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+
+    # No config.toml: the bundled defaults supply the retry block.
+    defaults = load_config(None).optimizer.retry
+    assert defaults.max_tries == 3
+    assert defaults.cooldown_days == 30
+    assert defaults.satisfied_score == 800000
+
+    # A partial override deep-merges over the defaults (only the named key changes).
+    path = _write(
+        tmp_path,
+        """
+        [optimizer.retry]
+        max_tries = 5
+        cooldown_days = 14
+        """,
+    )
+    retry = load_config(path).optimizer.retry
+    assert retry.max_tries == 5
+    assert retry.cooldown_days == 14
+    assert retry.satisfied_score == 800000  # untouched key keeps the default
+
+
 def test_parses_schedule(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")

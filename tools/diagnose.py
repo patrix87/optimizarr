@@ -23,7 +23,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from optimizarr.features.optimizer.config import default_topsis
+from optimizarr.features.optimizer.config import RetryConfig, default_topsis
 from optimizarr.features.optimizer.decision import decide
 from optimizarr.features.optimizer.topsis import HARD_REJECT_KEYWORDS, Topsis, _score_floor_tier
 
@@ -140,6 +140,7 @@ def _evaluate(rows: list[dict], t: Topsis) -> list[dict]:
             profile,
             target_res,
             current_file=cur,
+            satisfied_score=RetryConfig().satisfied_score,
         )
 
         # Run a scoring pass to get per-candidate closeness for the drill-down table.

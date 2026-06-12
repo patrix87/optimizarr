@@ -107,6 +107,18 @@ thursday  = { start = "23:00", end = "08:00" }
 friday    = { start = "23:00", end = "08:00" }
 saturday  = { start = "23:00", end = "08:00" }
 
+# ===== Insufficient-candidate retry =====
+# When a movie/episode has too few candidate releases to trust a TOPSIS comparison (fewer than
+# optimizer.topsis.min_candidates survive the filters), it is neither satisfied nor excluded yet:
+# it is retried on the following passes, counting attempts. After max_tries insufficient attempts
+# it is left alone for cooldown_days, then re-evaluated fresh (the try counter resets). Exception:
+# if the current file already scores at least satisfied_score, the file is good enough on its own,
+# so the item is marked satisfied immediately instead of being retried.
+[optimizer.retry]
+max_tries = 3            # insufficient-candidate attempts before entering the cooldown
+cooldown_days = 30       # days to leave an exhausted item alone before re-evaluating it fresh
+satisfied_score = 800000 # current-file score at/above which "too few candidates" still satisfies
+
 # ===== TOPSIS =====
 # Relative two-axis model. There are no per-preset size tables or shapes. For each movie:
 #   1. FILTER the obviously bad: drop negatives, apply three-tier score window (see below), keep

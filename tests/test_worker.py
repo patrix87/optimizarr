@@ -10,7 +10,7 @@ from optimizarr.features.optimizer.config import (
     ScheduleWindow,
     default_topsis,
 )
-from optimizarr.features.optimizer.state import SATISFIED, StateManager
+from optimizarr.features.optimizer.state import INSUFFICIENT, SATISFIED, StateManager
 from optimizarr.features.optimizer.topsis import GB, Topsis
 from optimizarr.features.optimizer.worker import (
     _MANUAL_IMPORT_MAX_FAILS,
@@ -285,6 +285,33 @@ def test_process_one_hold_marks_satisfied(tmp_path):
     entry = state.get("radarr", 1)
     assert entry is not None and entry.status == SATISFIED and entry.profile == "2160p Quality"
     assert adapter.grabbed == []
+
+
+def test_process_one_insufficient_records_retry(tmp_path):
+    # A single candidate (below min_candidates) with a low-scoring current file -> too few to
+    # compare -> the item is recorded as an insufficient retry, not satisfied, not grabbed.
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(
+        releases=[_release(score=900_000, resolution=2160, size_gb=18.0)],
+        current_file=_file(score=200_000, resolution=2160, size_gb=30.0),
+    )
+    w = _worker(state)
+    w._process_one(_ctx(adapter), 1)
+    entry = state.get("radarr", 1)
+    assert entry is not None and entry.status == INSUFFICIENT and entry.tries == 1
+    assert adapter.grabbed == []
+
+
+def test_process_one_insufficient_satisfies_above_threshold(tmp_path):
+    # Too few candidates, but the current file is already above retry.satisfied_score -> satisfied.
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(
+        releases=[_release(score=900_000, resolution=2160, size_gb=18.0)],
+        current_file=_file(score=900_000, resolution=2160, size_gb=18.0),
+    )
+    _worker(state)._process_one(_ctx(adapter), 1)
+    entry = state.get("radarr", 1)
+    assert entry is not None and entry.status == SATISFIED
 
 
 def test_process_one_act_grabs_without_marking(tmp_path):

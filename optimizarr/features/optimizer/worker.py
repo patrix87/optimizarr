@@ -319,15 +319,20 @@ class OptimizerWorker:
             current_file,
             allow_size_increase=ctx.app_cfg.allow_size_increase,
             allow_quality_downgrade=ctx.app_cfg.allow_quality_downgrade,
+            satisfied_score=self.opt.retry.satisfied_score,
         )
         label = adapter.label(item)
         logger.info("%s", format_decision(adapter.app, label, decision, self.dry_run))
 
         if decision.action == "HOLD":
-            # Satisfy (permanently) ONLY when the current imported file is optimal for its profile.
-            # An insufficient-candidates HOLD (decision.satisfy=False) is left in the pool to retry.
-            if decision.satisfy and not self.dry_run:
-                self.state.mark_satisfied(adapter.app, item_id, profile_name)
+            # Satisfy (permanently) when the current imported file is optimal for its profile.
+            # An insufficient-candidates HOLD instead counts a retry attempt and, once the tries
+            # are exhausted, rests the item for the configured cooldown (state handles the rest).
+            if not self.dry_run:
+                if decision.satisfy:
+                    self.state.mark_satisfied(adapter.app, item_id, profile_name)
+                elif decision.insufficient:
+                    self._record_insufficient(ctx, item_id, profile_name, label)
             return
 
         # ACT: grab, but do NOT record anything. If the download succeeds, the next
@@ -336,6 +341,32 @@ class OptimizerWorker:
         # only success/failure signal we need.
         if not self.dry_run:
             adapter.grab(decision.release or {})
+
+    def _record_insufficient(
+        self, ctx: _AppContext, item_id: int, profile_name: str | None, label: str
+    ) -> None:
+        """Count a too-few-candidates attempt for an item and log the outcome: either it will be
+        retried on a later pass, or it has exhausted its tries and is rested until retry_after."""
+        retry = self.opt.retry
+        entry = self.state.record_insufficient(
+            ctx.adapter.app, item_id, profile_name, retry.max_tries, retry.cooldown_days
+        )
+        if entry.retry_after is not None:
+            logger.info(
+                "[%s] %s: too few candidates after %d tries; resting until %s",
+                ctx.adapter.app,
+                label,
+                entry.tries,
+                entry.retry_after,
+            )
+        else:
+            logger.info(
+                "[%s] %s: too few candidates (try %d/%d); will retry on a later pass",
+                ctx.adapter.app,
+                label,
+                entry.tries,
+                retry.max_tries,
+            )
 
     def _handle_queue_imports(self, ctx: _AppContext) -> None:
         """At most one in-flight manualimport per app per tick.

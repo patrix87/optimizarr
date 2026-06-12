@@ -40,7 +40,21 @@ def test_act_on_clear_upgrade():
 
 def test_too_few_candidates_holds_without_satisfying():
     d = decide(_topsis(), [_release()], 2.0, "2160p Quality", 2160, current_file=_file())
-    assert d.action == "HOLD" and d.satisfy is False
+    assert d.action == "HOLD" and d.satisfy is False and d.insufficient is True
+
+
+def test_too_few_candidates_satisfies_when_current_score_above_threshold():
+    # Only one candidate (too few), but the current file already scores above the threshold ->
+    # the file is good enough on its own, so satisfy instead of an insufficient retry.
+    cur = _file(score=900_000, resolution=2160, size_gb=20.0)
+    d = decide(_topsis(), [_release()], 2.0, "2160p Quality", 2160, cur, satisfied_score=800_000)
+    assert d.action == "HOLD" and d.satisfy is True and d.insufficient is False
+
+
+def test_too_few_candidates_below_threshold_stays_insufficient():
+    cur = _file(score=700_000, resolution=2160, size_gb=20.0)
+    d = decide(_topsis(), [_release()], 2.0, "2160p Quality", 2160, cur, satisfied_score=800_000)
+    assert d.action == "HOLD" and d.satisfy is False and d.insufficient is True
 
 
 def test_hold_and_satisfy_when_current_optimal():

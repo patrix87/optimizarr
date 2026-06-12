@@ -29,6 +29,7 @@ class Decision:
     action: str  # "ACT" or "HOLD"
     reason: str
     satisfy: bool = False  # HOLD only: True => current file is optimal, mark satisfied (permanent)
+    insufficient: bool = False  # HOLD only: True => too few candidates, count a retry attempt
     profile_name: str | None = None
     current: dict | None = None  # {score, resolution, gbh, size_gb, closeness}
     pick: dict | None = None  # {score, resolution, gbh, size_gb, closeness, title}
@@ -68,6 +69,7 @@ def decide(
     current_file: dict | None,
     allow_size_increase: bool = True,
     allow_quality_downgrade: bool = True,
+    satisfied_score: int | None = None,
 ) -> Decision:
     """Pure decision: filter + relatively score the candidates, then ACT on the best one if it
     beats the current file's closeness, else HOLD (satisfying iff there were enough candidates to
@@ -75,7 +77,11 @@ def decide(
 
     Two optional pre-filters apply before scoring (per-app policy):
       - allow_size_increase=False drops releases bigger than the current file;
-      - allow_quality_downgrade=False drops releases with a lower customFormatScore."""
+      - allow_quality_downgrade=False drops releases with a lower customFormatScore.
+
+    `satisfied_score`: when too few candidates survive but the current file already scores at least
+    this, the file is good enough on its own -> HOLD and satisfy (instead of an insufficient retry).
+    """
     cur = current_file or {}
     cur_size = cur.get("size")
     if not allow_size_increase and isinstance(cur_size, int) and cur_size > 0:
@@ -89,12 +95,25 @@ def decide(
 
     cur_raw = _current_raw(cur, runtime_h) if current_file else None
 
-    # Not enough to compare: HOLD but do NOT satisfy, so the movie is retried when more appear.
+    # Not enough to compare. If the current file already scores at least satisfied_score, it is
+    # good enough on its own -> satisfy. Otherwise HOLD as insufficient so the worker counts a
+    # retry attempt (and eventually rests the item), without satisfying or excluding it.
     if len(kept) < topsis.cfg.min_candidates:
+        if satisfied_score is not None and cur_score is not None and cur_score >= satisfied_score:
+            return Decision(
+                "HOLD",
+                f"too few candidates ({len(kept)} < {topsis.cfg.min_candidates}) but current "
+                f"score {cur_score:,} >= {satisfied_score:,}; satisfied",
+                satisfy=True,
+                profile_name=profile_name,
+                current={"closeness": None, **cur_raw} if cur_raw else None,
+                diag=diag,
+            )
         return Decision(
             "HOLD",
             f"too few candidates to compare ({len(kept)} < {topsis.cfg.min_candidates})",
             satisfy=False,
+            insufficient=True,
             profile_name=profile_name,
             current={"closeness": None, **cur_raw} if cur_raw else None,
             diag=diag,

@@ -51,8 +51,16 @@ every profile (`topsis.py::apply_prefilters`):
    catch them; this relative check is what does.
 
 If fewer than `min_candidates` (default 6) survive all filters, the relative min-max is not
-trustworthy, so the decision is **HOLD without satisfying** — the movie is retried later when more
-releases appear. `min_candidates` also controls when the score-window tier is accepted vs expanded.
+trustworthy, so the decision is **HOLD as insufficient**: the movie is not satisfied or excluded,
+just retried on later passes (see the retry/cooldown handling below). `min_candidates` also controls
+when the score-window tier is accepted vs expanded.
+
+**Insufficient-candidate retry/cooldown.** An insufficient HOLD is counted in `state.json`. While
+the count is below `optimizer.retry.max_tries` (default 3) the item stays active and is retried each
+pass; once it exhausts its tries it is rested for `optimizer.retry.cooldown_days` (default 30), then
+re-evaluated fresh (the counter resets). The one exception: if the current file already scores at
+least `optimizer.retry.satisfied_score` (default 800000) it is good enough on its own, so the item
+is marked **satisfied** immediately instead of being retried.
 
 ---
 
@@ -106,8 +114,11 @@ compare to the current file.
   lower-scoring.
 - Otherwise **HOLD**. Two kinds:
   - **satisfiable** — there were enough candidates and none cleared either threshold: the current
-    file is good enough for its profile, so mark it satisfied (permanent).
-  - **insufficient** — fewer than `min_candidates`: do *not* satisfy; retry later.
+    file is good enough for its profile, so mark it satisfied (permanent). Also reached when there
+    are too few candidates but the current file already scores `>= retry.satisfied_score`.
+  - **insufficient** — fewer than `min_candidates` and the current file is below
+    `retry.satisfied_score`: do *not* satisfy; count a retry attempt and, after `retry.max_tries`,
+    rest the item for `retry.cooldown_days` before re-evaluating it fresh.
 
 The forbidden quadrant is impossible: a candidate worse on both axes (lower score, bigger size)
 cannot clear either threshold and therefore never triggers ACT.
@@ -135,6 +146,11 @@ min_size_delta_gb = 0.5        # ...or if current.size - pick.size >= this (in G
 [optimizer.topsis.presets.Efficient]
 score = 0.40                   # weights (score + size, sum 1.0) — the only per-profile knob
 size = 0.60
+
+[optimizer.retry]              # insufficient-candidate retry/cooldown handling
+max_tries = 3                  # too-few-candidate attempts before resting the item
+cooldown_days = 30             # days to leave an exhausted item alone before re-evaluating it
+satisfied_score = 800000       # current-file score that satisfies despite too few candidates
 ```
 
 A profile attaches to the preset whose name is a case-insensitive substring of the profile name
@@ -156,16 +172,22 @@ build the active pool, gate on the download queue, then evaluate one item.
 - `process_interval_seconds` (default 15, min 10) doubles as a settle delay after a grab.
 - `pick_order` only changes which items are improved first, never the per-item decision.
 
-### Per-item state lifecycle (one-and-done)
+### Per-item state lifecycle
 
-`state.json` (keyed by item id) records, per satisfied item, **the profile it was satisfied for**.
+`state.json` (keyed by item id) records **the profile each entry pertains to** plus, for an
+insufficient entry, its retry count and cooldown end.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Unprocessed: not in state
     Unprocessed --> Unprocessed: ACT grab posted (state unchanged)
     Unprocessed --> Satisfied: HOLD, current file optimal for its profile
+    Unprocessed --> Insufficient: HOLD, too few candidates
+    Insufficient --> Insufficient: retry (tries < max_tries)
+    Insufficient --> Insufficient: cooldown after max_tries, then re-evaluate fresh
+    Insufficient --> Satisfied: better file imported OR current score >= satisfied_score
     Satisfied --> Unprocessed: profile changed OR file removed
+    Insufficient --> Unprocessed: profile changed OR file removed
 ```
 
 - A grab is **never recorded**. A grab that succeeds replaces the file; the next evaluation finds
@@ -175,6 +197,9 @@ stateDiagram-v2
 - Satisfied is **permanent**: there is no time-based re-evaluation. A satisfied movie becomes
   eligible again only if its **profile changes** (the optimal pick depends on the profile) or its
   **file is removed**. To force a full re-run, delete (or edit) `state.json`.
+- Insufficient is **transient**: too few candidates to compare. It is retried each pass until
+  `retry.max_tries` attempts, then rested for `retry.cooldown_days` and re-evaluated fresh. A
+  profile change or removed file re-opens it immediately, exactly like satisfied.
 
 ### Active-hours schedule
 
