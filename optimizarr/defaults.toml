@@ -39,15 +39,15 @@ queue_max = 0
 import_max = 1
 # Order the worker walks the library each pass. This only changes which items are improved FIRST,
 # never the per-item decision (so it never changes WHAT gets grabbed, only the order it happens):
-#   random             shuffle each pass (default)
+#   random             shuffle each pass
 #   alphabetical_asc   A->Z by title           alphabetical_desc   Z->A by title
 #   size_asc           smallest file first      size_desc           biggest file first
 #   date_added_asc     oldest import first      date_added_desc     newest import first
 #   release_date_asc   oldest release first      release_date_desc   newest release first
-pick_order = "random"
+pick_order = "size_desc"
 # Short loop: seconds between processing items. Also the wait when the queue is full or the list
 # is exhausted, and the settle delay so a grab surfaces in the queue before the next read. Min 10.
-process_interval_seconds = 300
+process_interval_seconds = 120
 # Long loop: how often to re-fetch the full library list from Radarr/Sonarr.
 list_refresh_minutes = 15
 # One-and-done: a movie satisfied for its profile is never re-evaluated automatically. It becomes
