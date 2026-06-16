@@ -354,6 +354,26 @@ def test_retry_defaults_and_override(monkeypatch, tmp_path):
     assert retry.satisfied_score == 800000  # untouched key keeps the default
 
 
+def test_grab_defaults_and_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+
+    defaults = load_config(None).optimizer.grab
+    assert defaults.max_tries == 5
+    assert defaults.settle_minutes == 10
+
+    path = _write(
+        tmp_path,
+        """
+        [optimizer.grab]
+        max_tries = 2
+        """,
+    )
+    grab = load_config(path).optimizer.grab
+    assert grab.max_tries == 2
+    assert grab.settle_minutes == 10  # untouched key keeps the default
+
+
 def test_parses_schedule(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")

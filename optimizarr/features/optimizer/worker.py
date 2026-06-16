@@ -21,7 +21,7 @@ import logging
 import random
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from optimizarr.arr import ArrApi, build_client
@@ -302,13 +302,41 @@ class OptimizerWorker:
 
         ctx.pool = order_pool(ctx.pool, ctx.items_by_id, ctx.adapter, self.opt.pick_order)
 
+    def _reconcile_in_flight(self, ctx: _AppContext, queue_ids: set[int], now: datetime) -> None:
+        """Resolve in-flight grabs from data already in hand (no indexer call). Once a grabbed item
+        has left the queue AND its settle window has elapsed, a changed current-file id means the
+        grab imported -> satisfy; an unchanged file means it failed -> open (try the next-best
+        untried release next pass). The settle window guards the gap between the grab POST and the
+        download appearing in the queue, so a just-grabbed item is never called failed too early."""
+        adapter = ctx.adapter
+        settle = timedelta(minutes=self.opt.grab.settle_minutes)
+        for item_id, entry in self.state.in_flight_items(adapter.app):
+            if item_id in queue_ids:
+                continue  # still downloading / waiting to import -> keep waiting
+            if entry.grabbed_at and now - datetime.fromisoformat(entry.grabbed_at) < settle:
+                continue  # within the settle window -> not yet resolved
+            item = ctx.items_by_id.get(item_id)
+            if item is None:
+                continue  # not in the current list (removed / age-gated) -> leave as-is
+            imported = adapter.current_file_id(item) != entry.grabbed_file_id
+            self.state.resolve_in_flight(adapter.app, item_id, imported)
+            logger.info(
+                "[%s] %s: in-flight grab resolved -> %s",
+                adapter.app,
+                adapter.label(item),
+                "imported, satisfied" if imported else "failed, will try next-best",
+            )
+
     def _process_one(self, ctx: _AppContext, item_id: int) -> None:
         adapter = ctx.adapter
         item = ctx.items_by_id[item_id]
         runtime_h = adapter.runtime_h(item)
         profile_name, target_res = adapter.profile_for(item)
+        has_file = adapter.has_file(item)
         current_file = adapter.current_file(item)
         releases = adapter.releases(item)
+        # Releases already grabbed for this item are never grabbed again (anti-oscillation).
+        tried = self.state.tried_guids(adapter.app, item_id, profile_name, has_file)
 
         decision = decide(
             self.topsis,
@@ -320,14 +348,15 @@ class OptimizerWorker:
             allow_size_increase=ctx.app_cfg.allow_size_increase,
             allow_quality_downgrade=ctx.app_cfg.allow_quality_downgrade,
             satisfied_score=self.opt.retry.satisfied_score,
+            tried_guids=tried,
         )
         label = adapter.label(item)
         logger.info("%s", format_decision(adapter.app, label, decision, self.dry_run))
 
         if decision.action == "HOLD":
-            # Satisfy (permanently) when the current imported file is optimal for its profile.
-            # An insufficient-candidates HOLD instead counts a retry attempt and, once the tries
-            # are exhausted, rests the item for the configured cooldown (state handles the rest).
+            # Satisfy (permanently) when the current file is optimal for its profile (incl. the
+            # give-up case: nothing UNTRIED beats it). An insufficient-candidates HOLD instead
+            # counts a retry attempt and, once exhausted, rests the item for the cooldown.
             if not self.dry_run:
                 if decision.satisfy:
                     self.state.mark_satisfied(adapter.app, item_id, profile_name)
@@ -335,12 +364,31 @@ class OptimizerWorker:
                     self._record_insufficient(ctx, item_id, profile_name, label)
             return
 
-        # ACT: grab, but do NOT record anything. If the download succeeds, the next
-        # evaluation HOLDs and marks it satisfied; if it fails, the item stays in the pool
-        # and is retried later (the failed release now blocklisted). Re-evaluation is the
-        # only success/failure signal we need.
-        if not self.dry_run:
-            adapter.grab(decision.release or {})
+        # ACT. Grab cap: after grab.max_tries distinct releases without satisfying, park the item
+        # for a cooldown instead of grabbing yet another (bounds downloads when the indexer keeps
+        # surfacing fresh-but-doomed releases).
+        if self.dry_run:
+            return
+        if len(tried) >= self.opt.grab.max_tries:
+            self.state.park(adapter.app, item_id, profile_name, self.opt.retry.cooldown_days)
+            logger.info(
+                "[%s] %s: grabbed %d releases without satisfying; parking for %d days",
+                adapter.app,
+                label,
+                len(tried),
+                self.opt.retry.cooldown_days,
+            )
+            return
+
+        # Record the grab as in-flight BEFORE the POST so a crash in between cannot double-grab:
+        # the guid is now in tried_guids, and reconciliation will treat the (possibly never-sent)
+        # grab as failed and move on to the next-best untried release.
+        guid = (decision.release or {}).get("guid")
+        if guid:
+            self.state.record_grab(
+                adapter.app, item_id, profile_name, guid, adapter.current_file_id(item)
+            )
+        adapter.grab(decision.release or {})
 
     def _record_insufficient(
         self, ctx: _AppContext, item_id: int, profile_name: str | None, label: str
@@ -546,6 +594,10 @@ class OptimizerWorker:
         else:
             queue_count = len(records)
         import_count = sum(1 for r in records if adapter.is_queue_item_pending_import(r))
+
+        # Resolve finished grabs (in_flight -> satisfied/open) before building the pool, so a
+        # resolved item is correctly included/excluded this pass. No indexer call.
+        self._reconcile_in_flight(ctx, queue_ids, now)
 
         if not ctx.pool:
             self._build_pool(ctx)

@@ -119,6 +119,17 @@ max_tries = 3            # insufficient-candidate attempts before entering the c
 cooldown_days = 30       # days to leave an exhausted item alone before re-evaluating it fresh
 satisfied_score = 800000 # current-file score at/above which "too few candidates" still satisfies
 
+# ===== Grab lifecycle (anti-oscillation) =====
+# Every release grabbed for an item is remembered and NEVER grabbed again. A grab is held "in
+# flight" until it leaves the download queue and settles: a changed file means it imported (the item
+# is satisfied, with no extra indexer query), an unchanged file means it failed (the next-best
+# untried release is tried instead, the failed one now blocklisted). When the only releases that
+# would beat the current file are ones already tried, the item is satisfied. This makes the optimizer
+# resilient to releases whose search-time score does not survive import (the cause of re-grab loops).
+[optimizer.grab]
+max_tries = 5        # distinct releases to grab for one item before parking it for retry.cooldown_days
+settle_minutes = 10  # after a grab, wait this long AND for the item to leave the queue before re-eval
+
 # ===== TOPSIS =====
 # Relative two-axis model. There are no per-preset size tables or shapes. For each movie:
 #   1. FILTER the obviously bad: drop negatives, apply three-tier score window (see below), keep

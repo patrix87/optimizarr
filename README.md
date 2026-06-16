@@ -36,11 +36,12 @@ It does two jobs, both optional and independent:
   because they appeared.
 
 It is safe by design: it **never grows a file except on a real score upgrade** (a pick is never
-both lower-score *and* bigger than the current file), it **cannot oscillate** (once a satisfactory
-file is in place a movie is left alone, not re-evaluated unless its profile changes or its file is
-removed; a movie with too few candidates to judge is retried a few times, then rested for a
-configurable cooldown), and "optimized" means *the algorithm can no longer find anything better*, never merely
-"we triggered a grab" (grabs fail to download all the time, and it handles that).
+both lower-score *and* bigger than the current file), it **cannot oscillate** (every release it
+grabs for a movie is remembered and never grabbed again, so it can never loop on a release whose
+score does not survive import; once a satisfactory file is in place a movie is left alone unless its
+profile changes or its file is removed), and "optimized" means *the algorithm can no longer find
+anything better*, never merely "we triggered a grab" (grabs fail to download all the time, and it
+handles that).
 
 > Want the details: the per-preset size tables, the swap rule, the TOPSIS formulas, the config
 > model, and the worker loop? See **[ALGORITHM.md](ALGORITHM.md)**.

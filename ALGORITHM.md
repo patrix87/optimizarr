@@ -20,9 +20,11 @@ Three ideas carry the whole design:
   **never** be worse *and* bigger. That falls out for free: a candidate worse on both axes must
   improve by at least one concrete threshold (`min_score_delta` or `min_size_delta_gb`) to ACT,
   which a worse+bigger candidate never can.
-- **One-and-done.** A movie is optimized once: when its current (imported) file is the best pick
-  for its profile it is marked *satisfied* and never re-evaluated. This removes re-evaluation loops
-  that could oscillate.
+- **One-and-done, and never the same release twice.** A movie is optimized once: when its current
+  (imported) file is the best pick for its profile it is marked *satisfied* and never re-evaluated.
+  Every release ever grabbed for a movie is remembered (`tried_guids`) and never grabbed again, so
+  the optimizer cannot oscillate even when a release's score does not survive import (see
+  [§5](#5-the-worker-loop-and-state)).
 
 ---
 
@@ -103,9 +105,13 @@ into the score, and filter 3 already pins it).
 
 ## 3. The decision
 
-`decision.py::decide`: resolve the profile → run the filters → relatively score the survivors →
-compare to the current file.
+`decision.py::decide`: resolve the profile → drop already-tried releases → run the filters →
+relatively score the survivors → compare to the current file.
 
+- **Tried releases are dropped first.** Any release whose `guid` is in the movie's `tried_guids`
+  (everything ever grabbed for it) is removed before scoring, so the same release is never grabbed
+  twice. If the only releases that would beat the current file are tried ones, nothing untried
+  clears the gate and the movie is satisfied (the anti-oscillation give-up).
 - ACT on the best candidate (highest TOPSIS closeness) **iff** it clears at least one concrete
   threshold vs the current file: score improves by `>= min_score_delta` (default `100`) **or**
   size shrinks by `>= min_size_delta_gb` (default `0.5 GB`). When there is no current file, any
@@ -151,6 +157,10 @@ size = 0.60
 max_tries = 3                  # too-few-candidate attempts before resting the item
 cooldown_days = 30             # days to leave an exhausted item alone before re-evaluating it
 satisfied_score = 800000       # current-file score that satisfies despite too few candidates
+
+[optimizer.grab]               # grab lifecycle / anti-oscillation
+max_tries = 5                  # distinct releases to grab for one item before parking (cooldown_days)
+settle_minutes = 10            # wait this long AND for the item to leave the queue before resolving
 ```
 
 A profile attaches to the preset whose name is a case-insensitive substring of the profile name
@@ -167,39 +177,53 @@ build the active pool, gate on the download queue, then evaluate one item.
 - **Safe refresh.** The library fetch is guarded: a failed or interrupted fetch keeps the previous
   item set and retries next tick. State is **never** pruned from the list, so a connection blip can
   never wipe it.
-- **One queue fetch per tick** serves both the pace gate (`queue_max`) and the "already
-  downloading?" skip, so there is no in-flight state to track and a restart needs no reconciliation.
+- **One queue fetch per tick** serves the pace gate (`queue_max`), the "already downloading?" skip,
+  and in-flight reconciliation.
 - `process_interval_seconds` (default 15, min 10) doubles as a settle delay after a grab.
 - `pick_order` only changes which items are improved first, never the per-item decision.
 
 ### Per-item state lifecycle
 
-`state.json` (keyed by item id) records **the profile each entry pertains to** plus, for an
-insufficient entry, its retry count and cooldown end.
+`state.json` (keyed by item id) records, per item, the **profile** it pertains to and
+**`tried_guids`** (every release ever grabbed for it; never grabbed again). In-flight entries also
+store the grabbed release, grab time, and the file id at grab time; insufficient entries store the
+retry count and cooldown end. Every grab IS recorded (status `in_flight`), persisted *before* the
+grab is posted so a crash can never double-grab.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Unprocessed: not in state
-    Unprocessed --> Unprocessed: ACT grab posted (state unchanged)
-    Unprocessed --> Satisfied: HOLD, current file optimal for its profile
+    Unprocessed --> InFlight: ACT, grab an untried release (recorded before POST)
+    Open --> InFlight: ACT, grab next-best untried release
+    Unprocessed --> Satisfied: HOLD, current file optimal (nothing untried beats it)
+    Open --> Satisfied: HOLD, nothing untried beats the current file
     Unprocessed --> Insufficient: HOLD, too few candidates
-    Insufficient --> Insufficient: retry (tries < max_tries)
-    Insufficient --> Insufficient: cooldown after max_tries, then re-evaluate fresh
-    Insufficient --> Satisfied: better file imported OR current score >= satisfied_score
+    InFlight --> Satisfied: download imported (file id changed)
+    InFlight --> Open: download failed (file unchanged); try next-best
+    Open --> Parked: grab.max_tries reached; cooldown then fresh
+    Insufficient --> Insufficient: retry, then cooldown after max_tries
+    Insufficient --> Satisfied: current score >= satisfied_score
     Satisfied --> Unprocessed: profile changed OR file removed
-    Insufficient --> Unprocessed: profile changed OR file removed
+    Open --> Unprocessed: profile changed OR file removed
+    Parked --> Unprocessed: cooldown elapsed (memory cleared)
 ```
 
-- A grab is **never recorded**. A grab that succeeds replaces the file; the next evaluation finds
-  it optimal → satisfied. A grab that fails was never satisfied, so the item is retried, and the
-  dead release is now blocklisted (so filter 1 drops it and the next-best is tried). This relies on
-  Radarr/Sonarr **Failed Download Handling** (default on).
-- Satisfied is **permanent**: there is no time-based re-evaluation. A satisfied movie becomes
-  eligible again only if its **profile changes** (the optimal pick depends on the profile) or its
-  **file is removed**. To force a full re-run, delete (or edit) `state.json`.
-- Insufficient is **transient**: too few candidates to compare. It is retried each pass until
-  `retry.max_tries` attempts, then rested for `retry.cooldown_days` and re-evaluated fresh. A
-  profile change or removed file re-opens it immediately, exactly like satisfied.
+- **In-flight resolution needs no indexer call.** When a grabbed item has left the download queue
+  and its settle window has passed, the worker compares the item's current file id to the one saved
+  at grab time: changed → the grab **imported** → satisfied; unchanged → it **failed** → open, and
+  the next-best untried release is tried next pass (the failed one is blocklisted by Radarr/Sonarr
+  **Failed Download Handling** *and* now in `tried_guids`). The settle window guards the gap between
+  the grab and its appearance in the queue, so a fresh grab is never declared failed too early.
+- **Never the same release twice.** Because every grab is remembered, the optimizer cannot loop on a
+  release whose search-time score does not survive import (the classic re-grab trap): it grabs that
+  release at most once, then either the import satisfies it or it moves on, giving up (satisfied)
+  when only tried releases would beat the file.
+- Satisfied is **permanent**: no time-based re-evaluation; eligible again only if the **profile
+  changes** or the **file is removed**. Insufficient and parked are **transient** cooldowns. A
+  profile change or removed file re-opens any state immediately and clears its grab memory.
+- **Restart-safe.** All writes are atomic and lock-guarded, and in-flight grabs are re-derived from
+  the live queue + file id on the next tick, so a restart mid-download neither re-grabs nor loses
+  track of what was already grabbed.
 
 ### Active-hours schedule
 

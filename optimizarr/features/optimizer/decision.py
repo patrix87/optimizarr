@@ -70,6 +70,7 @@ def decide(
     allow_size_increase: bool = True,
     allow_quality_downgrade: bool = True,
     satisfied_score: int | None = None,
+    tried_guids: set[str] | None = None,
 ) -> Decision:
     """Pure decision: filter + relatively score the candidates, then ACT on the best one if it
     beats the current file's closeness, else HOLD (satisfying iff there were enough candidates to
@@ -79,10 +80,16 @@ def decide(
       - allow_size_increase=False drops releases bigger than the current file;
       - allow_quality_downgrade=False drops releases with a lower customFormatScore.
 
+    `tried_guids`: releases already grabbed for this item; dropped before scoring so the same one
+    is never grabbed twice. When the only releases that would beat the current file are tried ones,
+    nothing untried clears the gate and the item is satisfied (the anti-oscillation give-up).
+
     `satisfied_score`: when too few candidates survive but the current file already scores at least
     this, the file is good enough on its own -> HOLD and satisfy (instead of an insufficient retry).
     """
     cur = current_file or {}
+    if tried_guids:
+        releases = [r for r in releases if r.get("guid") not in tried_guids]
     cur_size = cur.get("size")
     if not allow_size_increase and isinstance(cur_size, int) and cur_size > 0:
         releases = [r for r in releases if r.get("size", 0) <= cur_size]

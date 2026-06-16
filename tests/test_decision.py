@@ -57,6 +57,32 @@ def test_too_few_candidates_below_threshold_stays_insufficient():
     assert d.action == "HOLD" and d.satisfy is False and d.insufficient is True
 
 
+def test_tried_release_is_dropped_before_scoring():
+    # The best release is already tried; the next-best untried one is grabbed instead (never the
+    # tried one).
+    rels = [
+        _release("best", 1_000_000, 2160, 13.0),
+        _release("alt", 980_000, 2160, 14.0),
+        _release("filler", 950_000, 2160, 15.0),
+    ]
+    cur = _file(200_000, 2160, 30.0)
+    d = decide(_topsis(), rels, 2.0, "2160p Quality", 2160, cur, tried_guids={"best"})
+    assert d.action == "ACT" and d.release is not None and d.release["guid"] == "alt"
+
+
+def test_give_up_and_satisfy_when_only_tried_release_beats_current():
+    # The lone real upgrade is tried; the remaining untried releases are worse than the current
+    # file -> nothing untried clears the gate -> satisfy (this is the anti-oscillation give-up).
+    rels = [
+        _release("up", 1_000_000, 2160, 10.0),  # tried
+        _release("w1", 900_000, 2160, 20.0),  # worse on both
+        _release("w2", 880_000, 2160, 22.0),  # worse on both
+    ]
+    cur = _file(950_000, 2160, 12.0)
+    d = decide(_topsis(), rels, 2.0, "2160p Quality", 2160, cur, tried_guids={"up"})
+    assert d.action == "HOLD" and d.satisfy is True
+
+
 def test_hold_and_satisfy_when_current_optimal():
     cur = _file(1_000_000, 2160, 6.0)  # best score, small
     rels = [_release("same", 1_000_000, 2160, 6.0), _release("worse", 900_000, 2160, 25.0)]
@@ -71,8 +97,8 @@ def test_efficient_picks_smaller_quality_picks_higher_score():
     big = _release("big", 950_600, 2160, 24.9)  # ~12.5 GiB/h, top score
     eff = decide(_topsis(), [small, big], 2.0, "2160p Efficient", 2160, current_file=cur)
     qual = decide(_topsis(), [small, big], 2.0, "2160p Quality", 2160, current_file=cur)
-    assert eff.action == "ACT" and eff.release["guid"] == "small"
-    assert qual.action == "ACT" and qual.release["guid"] == "big"
+    assert eff.action == "ACT" and eff.release is not None and eff.release["guid"] == "small"
+    assert qual.action == "ACT" and qual.release is not None and qual.release["guid"] == "big"
 
 
 def test_pick_never_lower_score_and_bigger_than_current():
@@ -97,7 +123,7 @@ def test_allow_size_increase_false_drops_bigger():
         current_file=cur,
         allow_size_increase=False,
     )
-    assert d.action == "ACT" and d.release["guid"] == "small"  # best of the two survivors
+    assert d.action == "ACT" and d.release is not None and d.release["guid"] == "small"  # best
 
 
 def test_allow_quality_downgrade_false_drops_lower_score():
@@ -114,7 +140,7 @@ def test_allow_quality_downgrade_false_drops_lower_score():
         current_file=cur,
         allow_quality_downgrade=False,
     )
-    assert d.action == "ACT" and d.release["guid"] == "hi"
+    assert d.action == "ACT" and d.release is not None and d.release["guid"] == "hi"
 
 
 def test_unknown_current_score_treated_as_upgrade():

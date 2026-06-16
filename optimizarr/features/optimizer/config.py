@@ -116,6 +116,20 @@ class RetryConfig:
 
 
 @dataclass
+class GrabConfig:
+    """Grab lifecycle / anti-oscillation handling.
+
+    Every release grabbed for an item is remembered (tried_guids) and never grabbed again: when the
+    only releases that would beat the current file are ones already tried, the item is satisfied. A
+    grab is held in-flight until it leaves the queue and settles; a changed file id means it
+    imported (satisfy, no re-query), an unchanged file means it failed (try next-best). After
+    max_tries distinct grabs without satisfying, the item is parked for retry.cooldown_days."""
+
+    max_tries: int = 5
+    settle_minutes: int = 10
+
+
+@dataclass
 class ScheduleWindow:
     """One day's active window in local time. start >= end means the window crosses midnight."""
 
@@ -135,6 +149,7 @@ class OptimizerConfig:
     sonarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
     topsis: TopsisConfig = field(default_factory=lambda: default_topsis())
     retry: RetryConfig = field(default_factory=RetryConfig)
+    grab: GrabConfig = field(default_factory=GrabConfig)
     # Per-day active-hours schedule (weekday int -> window, 0=Monday 6=Sunday).
     # Empty dict means always active. Evaluation and list refresh are skipped outside the window;
     # queue import processing always continues.
@@ -255,6 +270,16 @@ def _parse_retry(raw: dict) -> RetryConfig:
     )
 
 
+def _parse_grab(raw: dict) -> GrabConfig:
+    max_tries = int(raw["max_tries"])
+    if max_tries < 1:
+        raise ValueError(f"optimizer.grab.max_tries must be >= 1, got {max_tries}")
+    settle_minutes = int(raw["settle_minutes"])
+    if settle_minutes < 0:
+        raise ValueError(f"optimizer.grab.settle_minutes must be >= 0, got {settle_minutes}")
+    return GrabConfig(max_tries=max_tries, settle_minutes=settle_minutes)
+
+
 def _parse_release_types(raw: object, allowed: set[str], where: str) -> list[str]:
     if isinstance(raw, str):
         raise ValueError(
@@ -346,6 +371,7 @@ def parse_optimizer(raw: dict) -> OptimizerConfig:
         sonarr=_parse_optimizer_app(raw["sonarr"], SONARR_RELEASE_TYPES, "optimizer.sonarr"),
         topsis=_parse_topsis(raw["topsis"]),
         retry=_parse_retry(raw["retry"]),
+        grab=_parse_grab(raw["grab"]),
         schedule=_parse_schedule(raw.get("schedule", {}), "optimizer.schedule"),
     )
 

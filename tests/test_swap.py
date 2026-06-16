@@ -50,7 +50,7 @@ def test_pick_is_never_lower_score_and_bigger():
             ]
             cur = _file(rnd.randint(0, 1_000_000), round(rnd.uniform(3.0, 30.0), 1))
             d = decide(T, pool, 2.0, f"2160p {profile}", 2160, current_file=cur)
-            if d.action != "ACT":
+            if d.action != "ACT" or d.pick is None:
                 continue
             cur_gb = cur["size"] / GB
             lower = (d.pick["score"] or 0) < (cur["customFormatScore"] or 0)

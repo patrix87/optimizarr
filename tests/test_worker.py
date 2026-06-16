@@ -1,6 +1,6 @@
 import logging
 import threading
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 
 from optimizarr.arr import ArrApi, RadarrApi
 from optimizarr.config import Connection
@@ -10,7 +10,14 @@ from optimizarr.features.optimizer.config import (
     ScheduleWindow,
     default_topsis,
 )
-from optimizarr.features.optimizer.state import INSUFFICIENT, SATISFIED, StateManager
+from optimizarr.features.optimizer.state import (
+    IN_FLIGHT,
+    INSUFFICIENT,
+    OPEN,
+    PARKED,
+    SATISFIED,
+    StateManager,
+)
 from optimizarr.features.optimizer.topsis import GB, Topsis
 from optimizarr.features.optimizer.worker import (
     _MANUAL_IMPORT_MAX_FAILS,
@@ -227,6 +234,7 @@ class _ProcessAdapter(ArrApi):
         self._releases = releases
         self._current = current_file
         self.grabbed: list[dict] = []
+        self.release_calls = 0
 
     def runtime_h(self, item):
         return 2.0
@@ -244,6 +252,7 @@ class _ProcessAdapter(ArrApi):
         return (self._current or {}).get("id")
 
     def releases(self, item):
+        self.release_calls += 1
         return self._releases
 
     def label(self, item):
@@ -269,6 +278,18 @@ def _ctx(adapter):
     ctx = _AppContext(adapter, OptimizerAppConfig())
     ctx.items_by_id = {1: {"id": 1}}
     return ctx
+
+
+def _settled_now(state=None):
+    """A 'now' comfortably past the default 10-minute grab settle window, so reconciliation treats
+    an in-flight grab as resolved."""
+    return datetime.now(UTC) + timedelta(minutes=11)
+
+
+def _get(state, item_id=1, app="radarr"):
+    entry = state.get(app, item_id)
+    assert entry is not None
+    return entry
 
 
 def test_process_one_hold_marks_satisfied(tmp_path):
@@ -314,20 +335,125 @@ def test_process_one_insufficient_satisfies_above_threshold(tmp_path):
     assert entry is not None and entry.status == SATISFIED
 
 
-def test_process_one_act_grabs_without_marking(tmp_path):
-    # A clear upgrade is grabbed, but the item is NOT marked satisfied — it stays in the
-    # pool until a later evaluation HOLDs (success) or it's retried (failure).
+def test_process_one_act_records_in_flight_before_grab(tmp_path):
+    # A clear upgrade is grabbed AND recorded in-flight (guid in tried_guids, current file id
+    # captured) so a crash can't double-grab and the same release is never grabbed again.
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(
         releases=[
-            _release(score=1_000_000, resolution=2160, size_gb=14.0),
-            _release(score=950_000, resolution=2160, size_gb=18.0),
+            _release(guid="best", score=1_000_000, resolution=2160, size_gb=14.0),
+            _release(guid="mid", score=950_000, resolution=2160, size_gb=18.0),
         ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     _worker(state)._process_one(_ctx(adapter), 1)
-    assert len(adapter.grabbed) == 1
-    assert state.get("radarr", 1) is None
+    assert [r["guid"] for r in adapter.grabbed] == ["best"]
+    entry = state.get("radarr", 1)
+    assert entry is not None and entry.status == IN_FLIGHT
+    assert entry.grabbed_guid == "best" and entry.tried_guids == ["best"]
+    assert entry.grabbed_file_id == 555  # current file id captured for the import probe
+
+
+def test_process_one_never_regrabs_a_tried_release(tmp_path):
+    # The only real upgrade has already been grabbed (in tried_guids); the remaining untried
+    # releases are worse than the current file -> give up and satisfy, never grab the tried one.
+    state = StateManager(str(tmp_path / "s.json"))
+    state.record_grab("radarr", 1, "2160p Quality", "up", 555)
+    state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried_guids=["up"]
+    adapter = _ProcessAdapter(
+        releases=[
+            _release(guid="up", score=1_000_000, resolution=2160, size_gb=10.0),  # tried
+            _release(guid="w1", score=900_000, resolution=2160, size_gb=20.0),  # worse
+            _release(guid="w2", score=880_000, resolution=2160, size_gb=22.0),  # worse
+        ],
+        current_file=_file(score=950_000, resolution=2160, size_gb=12.0),
+    )
+    _worker(state)._process_one(_ctx(adapter), 1)
+    assert adapter.grabbed == []
+    assert _get(state).status == SATISFIED
+
+
+def test_no_double_grab_across_a_failed_cycle(tmp_path):
+    # grab best -> in_flight -> reconcile as failed -> re-evaluate grabs the NEXT-best untried
+    # release, never the same one twice.
+    state = StateManager(str(tmp_path / "s.json"))
+    rels = [
+        _release(guid="up", score=1_000_000, resolution=2160, size_gb=10.0),
+        _release(guid="alt", score=980_000, resolution=2160, size_gb=11.0),
+        _release(guid="filler", score=950_000, resolution=2160, size_gb=12.0),
+    ]
+    adapter = _ProcessAdapter(
+        rels, current_file=_file(score=200_000, resolution=1080, size_gb=30.0)
+    )
+    w = _worker(state)
+    ctx = _ctx(adapter)
+
+    w._process_one(ctx, 1)  # grabs "up"
+    assert [r["guid"] for r in adapter.grabbed] == ["up"]
+    # The grab failed: download left the queue, file unchanged.
+    w._reconcile_in_flight(ctx, queue_ids=set(), now=_settled_now(state))
+    assert _get(state).status == OPEN
+
+    w._process_one(ctx, 1)  # grabs the next-best untried, "alt" — never "up" again
+    assert [r["guid"] for r in adapter.grabbed] == ["up", "alt"]
+
+
+def test_reconcile_imported_satisfies_without_requery(tmp_path):
+    # A grabbed item that left the queue with a CHANGED file id imported successfully -> satisfied,
+    # and reconciliation must not call the indexer (releases) to confirm it.
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
+    adapter._current["id"] = 555
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555)
+    adapter._current["id"] = 999  # import replaced the file
+    w = _worker(state)
+    w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now(state))
+    assert _get(state).status == SATISFIED
+    assert adapter.release_calls == 0  # no indexer query to confirm a successful grab
+
+
+def test_reconcile_failed_opens_and_keeps_memory(tmp_path):
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
+    adapter._current["id"] = 555
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555)  # file id unchanged after
+    w = _worker(state)
+    w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now(state))
+    entry = _get(state)
+    assert entry.status == OPEN and entry.tried_guids == ["best"]
+
+
+def test_reconcile_waits_while_in_queue_or_unsettled(tmp_path):
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
+    adapter._current["id"] = 999  # would look "imported" if it resolved
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555)
+    w = _worker(state)
+    # Still in the queue -> stays in flight.
+    w._reconcile_in_flight(_ctx(adapter), queue_ids={1}, now=_settled_now(state))
+    assert _get(state).status == IN_FLIGHT
+    # Not in queue but inside the settle window -> stays in flight.
+    w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=datetime.now(UTC))
+    assert _get(state).status == IN_FLIGHT
+
+
+def test_grab_cap_parks_after_max_tries(tmp_path):
+    state = StateManager(str(tmp_path / "s.json"))
+    # Pre-seed grab.max_tries (5) distinct tried releases.
+    for i in range(5):
+        state.record_grab("radarr", 1, "2160p Quality", f"g{i}", 555)
+    state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried has 5 guids
+    adapter = _ProcessAdapter(
+        releases=[
+            _release(guid="n1", score=1_000_000, resolution=2160, size_gb=10.0),
+            _release(guid="n2", score=980_000, resolution=2160, size_gb=11.0),
+        ],
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
+    )
+    _worker(state)._process_one(_ctx(adapter), 1)
+    assert adapter.grabbed == []  # capped, did not grab a 6th release
+    entry = _get(state)
+    assert entry.status == PARKED and entry.retry_after is not None
 
 
 def test_process_one_dry_run_does_not_grab(tmp_path):
