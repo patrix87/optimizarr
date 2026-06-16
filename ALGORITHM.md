@@ -171,16 +171,39 @@ or its weights for one profile.
 
 ## 5. The worker loop and state
 
-The optimizer is a continuous, interval-driven worker. Each tick: refresh the item list if due,
-build the active pool, gate on the download queue, then evaluate one item.
+The optimizer is a continuous, interval-driven worker. Each tick it reconciles any finished grabs,
+refreshes the item list if due, gates on the download queue, then evaluates at most one item. The
+flowchart below traces a single tick; the one place it ever calls the indexer is the highlighted
+`Search indexer` box, which is only reached for an item that is active, not already downloading, and
+not awaiting a grab.
 
-- **Safe refresh.** The library fetch is guarded: a failed or interrupted fetch keeps the previous
-  item set and retries next tick. State is **never** pruned from the list, so a connection blip can
-  never wipe it.
-- **One queue fetch per tick** serves the pace gate (`queue_max`), the "already downloading?" skip,
-  and in-flight reconciliation.
-- `process_interval_seconds` (default 15, min 10) doubles as a settle delay after a grab.
-- `pick_order` only changes which items are improved first, never the per-item decision.
+```mermaid
+flowchart TD
+    T[Worker tick] --> AH{Active hours?}
+    AH -- no --> DR[Drain queue imports only, no search]
+    AH -- yes --> Q[Fetch download queue once]
+    Q --> RC[Reconcile in-flight grabs, no indexer call]
+    RC --> RCq{In queue or within settle window?}
+    RCq -- yes --> RCk[Keep in_flight, wait]
+    RCq -- no --> RCf{File id changed since grab?}
+    RCf -- yes --> RCsat[Mark satisfied: imported]
+    RCf -- no --> RCopen[Mark open: grab failed, retry next-best later]
+    RC --> POOL[Build pool: skip satisfied, in_flight, active cooldowns]
+    POOL --> GATE{Queue and import gate ok?}
+    GATE -- no --> WAIT[Wait one tick]
+    GATE -- yes --> PICK[Pick one active item]
+    PICK --> INQ{Item already downloading?}
+    INQ -- yes --> WAIT
+    INQ -- no --> SRCH[Search indexer once for this item]:::io
+    SRCH --> DEC[Drop tried_guids, filter, TOPSIS score]
+    DEC --> ACTQ{An untried release clears the ACT gate?}
+    ACTQ -- no, enough candidates --> SAT[HOLD: satisfied]
+    ACTQ -- no, too few candidates --> INS[HOLD: insufficient, retry then cooldown]
+    ACTQ -- yes --> CAP{tried count ≥ grab.max_tries?}
+    CAP -- yes --> PARK[Park for cooldown]
+    CAP -- no --> REC[Record in_flight in state.json] --> GRAB[POST grab to *arr]
+    classDef io fill:#fde,stroke:#b27,stroke-width:2px;
+```
 
 ### Per-item state lifecycle
 
@@ -192,20 +215,36 @@ grab is posted so a crash can never double-grab.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Unprocessed: not in state
-    Unprocessed --> InFlight: ACT, grab an untried release (recorded before POST)
-    Open --> InFlight: ACT, grab next-best untried release
-    Unprocessed --> Satisfied: HOLD, current file optimal (nothing untried beats it)
-    Open --> Satisfied: HOLD, nothing untried beats the current file
-    Unprocessed --> Insufficient: HOLD, too few candidates
-    InFlight --> Satisfied: download imported (file id changed)
-    InFlight --> Open: download failed (file unchanged); try next-best
-    Open --> Parked: grab.max_tries reached; cooldown then fresh
-    Insufficient --> Insufficient: retry, then cooldown after max_tries
-    Insufficient --> Satisfied: current score >= satisfied_score
-    Satisfied --> Unprocessed: profile changed OR file removed
-    Open --> Unprocessed: profile changed OR file removed
-    Parked --> Unprocessed: cooldown elapsed (memory cleared)
+    [*] --> Eligible: not in state
+
+    Eligible --> InFlight: ACT, grab an untried release
+    Eligible --> Satisfied: HOLD, nothing untried beats current file
+    Eligible --> Insufficient: HOLD, too few candidates
+    Eligible --> Parked: grab cap reached, max_tries distinct grabs
+
+    InFlight --> InFlight: still downloading or settling
+    InFlight --> Satisfied: import detected, file id changed
+    InFlight --> Eligible: grab failed, file unchanged, try next-best
+
+    Insufficient --> Eligible: cooldown elapsed or more releases appear
+    Insufficient --> Satisfied: current score ≥ satisfied_score
+    Parked --> Eligible: cooldown elapsed, tried memory cleared
+
+    Satisfied --> Eligible: profile changed or file removed
+
+    note left of Eligible
+        Eligible = unprocessed, open, or a
+        cooldown (insufficient / parked)
+        whose timer has elapsed. Any state
+        returns here, memory cleared, when
+        the profile changes or the file is
+        removed.
+    end note
+    note right of Satisfied
+        Terminal until invalidated.
+        tried_guids persists, so the same
+        release is never grabbed twice.
+    end note
 ```
 
 - **In-flight resolution needs no indexer call.** When a grabbed item has left the download queue
@@ -224,6 +263,27 @@ stateDiagram-v2
 - **Restart-safe.** All writes are atomic and lock-guarded, and in-flight grabs are re-derived from
   the live queue + file id on the next tick, so a restart mid-download neither re-grabs nor loses
   track of what was already grabbed.
+
+### Why it cannot loop again (termination analysis)
+
+Every cycle in the graph is bounded, so no item can be grabbed or searched without end:
+
+- **A release is grabbed at most once per item.** Its `guid` enters `tried_guids` before the grab
+  and is filtered out forever after, so the search-vs-import score trap (a release that always looks
+  like an upgrade over the file it produced) can fire only once, not every cycle.
+- **In-flight always resolves.** An item with an outstanding grab is excluded from evaluation and is
+  resolved purely from the queue plus file id, so it never triggers a search while downloading and
+  always lands on satisfied (imported) or open (failed).
+- **The grab budget is finite.** Repeated failures walk through distinct releases until one imports,
+  the pool is exhausted (→ satisfied), or `grab.max_tries` is hit (→ parked for a cooldown). At most
+  `max_tries` grabs per item per cooldown window.
+- **Cooldowns are time-bounded.** Insufficient and parked items are inactive until their
+  `retry_after`, then re-evaluated fresh, capping how often a hard-to-place item is retried.
+
+The one residual stuck-state is a download that never leaves the queue (e.g. an `importBlocked` item
+needing manual action): the item simply stays `in_flight` and paused. That is safe (it never
+re-grabs and never searches), but it also never progresses on its own, so a permanently stuck queue
+item is the one case worth watching in the logs.
 
 ### Active-hours schedule
 

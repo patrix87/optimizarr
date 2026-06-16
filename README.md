@@ -43,8 +43,33 @@ profile changes or its file is removed), and "optimized" means *the algorithm ca
 anything better*, never merely "we triggered a grab" (grabs fail to download all the time, and it
 handles that).
 
-> Want the details: the per-preset size tables, the swap rule, the TOPSIS formulas, the config
-> model, and the worker loop? See **[ALGORITHM.md](ALGORITHM.md)**.
+### How each item moves through the optimizer
+
+Every item follows the lifecycle below. The key safety property is visible in it: a grabbed release
+is remembered (`tried_guids`) and never grabbed again, in-flight grabs resolve from the download
+queue and the file id (no extra indexer search to "confirm" success), and every loop is bounded, so
+the optimizer can never keep re-downloading the same release.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Eligible: not yet decided
+    Eligible --> InFlight: grab an untried release
+    Eligible --> Satisfied: nothing untried beats the current file
+    Eligible --> Insufficient: too few candidates to judge
+    Eligible --> Parked: grabbed max_tries releases without success
+
+    InFlight --> InFlight: still downloading
+    InFlight --> Satisfied: imported (file changed)
+    InFlight --> Eligible: download failed, try the next-best
+
+    Insufficient --> Eligible: cooldown ends or more releases appear
+    Insufficient --> Satisfied: current file already scores high enough
+    Parked --> Eligible: cooldown ends (grab memory cleared)
+    Satisfied --> Eligible: profile changed or file removed
+```
+
+> Want the details: the per-tick worker flowchart, the termination analysis, the TOPSIS formulas,
+> the config model, and the full state machine? See **[ALGORITHM.md](ALGORITHM.md)**.
 
 ## Transparency
 
