@@ -37,18 +37,23 @@ It does two jobs, both optional and independent:
 
 It is safe by design: it **never grows a file except on a real score upgrade** (a pick is never
 both lower-score *and* bigger than the current file), it **cannot oscillate** (every release it
-grabs for a movie is remembered and never grabbed again, so it can never loop on a release whose
-score does not survive import; once a satisfactory file is in place a movie is left alone unless its
-profile changes or its file is removed), and "optimized" means *the algorithm can no longer find
-anything better*, never merely "we triggered a grab" (grabs fail to download all the time, and it
-handles that).
+grabs for a movie *under its current profile* is remembered and not grabbed again for that profile,
+so it can never loop on a release whose score does not survive import; once a satisfactory file is in
+place a movie is left alone unless its profile changes or its file is removed), and "optimized" means
+*the algorithm can no longer find anything better*, never merely "we triggered a grab" (grabs fail to
+download all the time, and it handles that).
+
+> The grab memory is **per profile**: changing a movie's quality profile (or removing its file)
+> re-opens it and starts the memory fresh, so switching `2160p Quality` to `1080p Efficient` and back
+> can re-grab the best 2160p release the second time around. It is never a permanent global blocklist.
 
 ### How each item moves through the optimizer
 
 Every item follows the lifecycle below. The key safety property is visible in it: a grabbed release
-is remembered (`tried_guids`) and never grabbed again, in-flight grabs resolve from the download
-queue and the file id (no extra indexer search to "confirm" success), and every loop is bounded, so
-the optimizer can never keep re-downloading the same release.
+is remembered (`tried_guids`) and not grabbed again for the same profile, in-flight grabs resolve
+from the download queue and the file id (no extra indexer search to "confirm" success), and every
+loop is bounded, so the optimizer can never keep re-downloading the same release. A profile change or
+a removed file re-opens the item and clears that memory.
 
 ```mermaid
 stateDiagram-v2

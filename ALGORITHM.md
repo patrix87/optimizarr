@@ -22,8 +22,9 @@ Three ideas carry the whole design:
   which a worse+bigger candidate never can.
 - **One-and-done, and never the same release twice.** A movie is optimized once: when its current
   (imported) file is the best pick for its profile it is marked *satisfied* and never re-evaluated.
-  Every release ever grabbed for a movie is remembered (`tried_guids`) and never grabbed again, so
-  the optimizer cannot oscillate even when a release's score does not survive import (see
+  Every release grabbed for a movie under its current profile is remembered (`tried_guids`) and not
+  grabbed again for that profile, so the optimizer cannot oscillate even when a release's score does
+  not survive import. Changing the profile (or removing the file) clears that memory (see
   [§5](#5-the-worker-loop-and-state)).
 
 ---
@@ -253,10 +254,13 @@ stateDiagram-v2
   the next-best untried release is tried next pass (the failed one is blocklisted by Radarr/Sonarr
   **Failed Download Handling** *and* now in `tried_guids`). The settle window guards the gap between
   the grab and its appearance in the queue, so a fresh grab is never declared failed too early.
-- **Never the same release twice.** Because every grab is remembered, the optimizer cannot loop on a
-  release whose search-time score does not survive import (the classic re-grab trap): it grabs that
-  release at most once, then either the import satisfies it or it moves on, giving up (satisfied)
-  when only tried releases would beat the file.
+- **Never the same release twice (per profile).** Because every grab is remembered, the optimizer
+  cannot loop on a release whose search-time score does not survive import (the classic re-grab
+  trap): it grabs that release at most once, then either the import satisfies it or it moves on,
+  giving up (satisfied) when only tried releases would beat the file. The memory is scoped to the
+  movie's current profile, so changing the profile (or removing the file) clears it and the best
+  release for the newly selected profile can be grabbed again, even if it was grabbed under a prior
+  profile.
 - Satisfied is **permanent**: no time-based re-evaluation; eligible again only if the **profile
   changes** or the **file is removed**. Insufficient and parked are **transient** cooldowns. A
   profile change or removed file re-opens any state immediately and clears its grab memory.

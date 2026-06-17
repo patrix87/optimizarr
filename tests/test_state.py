@@ -145,6 +145,29 @@ def test_tried_guids_ignored_on_profile_change_or_no_file(tmp_path):
     assert m.tried_guids("radarr", 1, "2160p Quality", has_file=False) == set()  # file removed
 
 
+def test_profile_round_trip_reallows_a_previously_grabbed_release(tmp_path):
+    # Quality -> Efficient -> Quality must not permanently exclude the best 2160p release just
+    # because it was grabbed during the first Quality cycle: grab memory is per-profile.
+    m = _mgr(tmp_path)
+
+    # 1. Watch in 4K: grab + import a 2160p release "A" under Quality.
+    m.record_grab("radarr", 1, "2160p Quality", "A", 100)
+    entry = m.resolve_in_flight("radarr", 1, imported=True)
+    assert entry.status == SATISFIED
+    assert not m.is_active("radarr", 1, "2160p Quality", has_file=True)  # done for Quality
+
+    # 2. Switch to a leaner profile: active again, and "A" is not remembered for the new profile.
+    assert m.is_active("radarr", 1, "1080p Efficient", has_file=True)
+    assert m.tried_guids("radarr", 1, "1080p Efficient", has_file=True) == set()
+    m.record_grab("radarr", 1, "1080p Efficient", "B", 100)
+    m.resolve_in_flight("radarr", 1, imported=True)
+
+    # 3. Switch back to 2160p Quality months later: active again, and "A" is grabbable once more
+    #    (the grab memory is scoped to the profile and reset on a profile change).
+    assert m.is_active("radarr", 1, "2160p Quality", has_file=True)
+    assert m.tried_guids("radarr", 1, "2160p Quality", has_file=True) == set()
+
+
 def test_park_sets_cooldown_and_clears_memory(tmp_path):
     m = _mgr(tmp_path)
     m.record_grab("radarr", 1, "2160p Quality", "a", 555)
