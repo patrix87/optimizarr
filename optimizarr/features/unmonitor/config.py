@@ -4,25 +4,28 @@ The shared loader (optimizarr.config) delegates to parse_unmonitor() here, so th
 feature owns its own config surface.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from optimizarr.config import RADARR_RELEASE_TYPES, SONARR_RELEASE_TYPES
 
 
+# These dataclasses carry NO default values: every default lives in defaults.toml (the single source
+# of truth) and is read by parse_unmonitor() below with no Python-side fallback. To build a config
+# from the bundled defaults (e.g. in tests), parse them via default_unmonitor(), not field defaults.
 @dataclass
 class UnmonitorAppConfig:
-    days: int = 30
-    release_type: str = ""
-    require_cutoff_met: bool = True
+    days: int
+    release_type: str
+    require_cutoff_met: bool
 
 
 @dataclass
 class UnmonitorConfig:
-    enabled: bool = True
-    cron_schedule: str = "0 4 * * *"
-    run_on_start: bool = True
-    radarr: UnmonitorAppConfig = field(default_factory=UnmonitorAppConfig)
-    sonarr: UnmonitorAppConfig = field(default_factory=UnmonitorAppConfig)
+    enabled: bool
+    cron_schedule: str
+    run_on_start: bool
+    radarr: UnmonitorAppConfig
+    sonarr: UnmonitorAppConfig
 
 
 def _parse_unmonitor_app(raw: dict, allowed: set[str], where: str) -> UnmonitorAppConfig:
@@ -44,3 +47,12 @@ def parse_unmonitor(raw: dict) -> UnmonitorConfig:
         radarr=_parse_unmonitor_app(raw["radarr"], RADARR_RELEASE_TYPES, "unmonitor.radarr"),
         sonarr=_parse_unmonitor_app(raw["sonarr"], SONARR_RELEASE_TYPES, "unmonitor.sonarr"),
     )
+
+
+def default_unmonitor() -> UnmonitorConfig:
+    """Parse the bundled defaults' [unmonitor] section. Defaults live only in defaults.toml; tests
+    build a baseline from this (then dataclasses.replace to vary one field) instead of hardcoding
+    values, so changing a default in defaults.toml never requires a test edit."""
+    from optimizarr.config import _load_defaults
+
+    return parse_unmonitor(_load_defaults()["unmonitor"])
