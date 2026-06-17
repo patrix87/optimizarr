@@ -125,7 +125,7 @@ class GrabConfig:
     imported (satisfy, no re-query), an unchanged file means it failed (try next-best). After
     max_tries distinct grabs without satisfying, the item is parked for retry.cooldown_days."""
 
-    max_tries: int = 5
+    max_tries: int = 10
     settle_minutes: int = 10
 
 

@@ -47,9 +47,9 @@ import_max = 1
 pick_order = "size_desc"
 # Short loop: seconds between processing items. Also the wait when the queue is full or the list
 # is exhausted, and the settle delay so a grab surfaces in the queue before the next read. Min 10.
-process_interval_seconds = 120
+process_interval_seconds = 300
 # Long loop: how often to re-fetch the full library list from Radarr/Sonarr.
-list_refresh_minutes = 15
+list_refresh_minutes = 60
 # One-and-done: a movie satisfied for its profile is never re-evaluated automatically. It becomes
 # eligible again only if its profile changes or its file is removed; to force a full re-run, delete
 # (or edit) the state.json. There is no time-based re-evaluation.
@@ -127,7 +127,7 @@ satisfied_score = 800000 # current-file score at/above which "too few candidates
 # would beat the current file are ones already tried, the item is satisfied. This makes the optimizer
 # resilient to releases whose search-time score does not survive import (the cause of re-grab loops).
 [optimizer.grab]
-max_tries = 5        # distinct releases to grab for one item before parking it for retry.cooldown_days
+max_tries = 10       # distinct releases to grab for one item before parking it for retry.cooldown_days
 settle_minutes = 10  # after a grab, wait this long AND for the item to leave the queue before re-eval
 
 # ===== TOPSIS =====

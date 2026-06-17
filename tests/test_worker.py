@@ -5,6 +5,7 @@ from datetime import UTC, datetime, time, timedelta
 from optimizarr.arr import ArrApi, RadarrApi
 from optimizarr.config import Connection
 from optimizarr.features.optimizer.config import (
+    GrabConfig,
     OptimizerAppConfig,
     OptimizerConfig,
     ScheduleWindow,
@@ -439,10 +440,11 @@ def test_reconcile_waits_while_in_queue_or_unsettled(tmp_path):
 
 def test_grab_cap_parks_after_max_tries(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
-    # Pre-seed grab.max_tries (5) distinct tried releases.
-    for i in range(5):
+    cap = 3
+    # Pre-seed `cap` distinct tried releases.
+    for i in range(cap):
         state.record_grab("radarr", 1, "2160p Quality", f"g{i}", 555)
-    state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried has 5 guids
+    state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried has `cap` guids
     adapter = _ProcessAdapter(
         releases=[
             _release(guid="n1", score=1_000_000, resolution=2160, size_gb=10.0),
@@ -450,8 +452,10 @@ def test_grab_cap_parks_after_max_tries(tmp_path):
         ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
-    _worker(state)._process_one(_ctx(adapter), 1)
-    assert adapter.grabbed == []  # capped, did not grab a 6th release
+    w = _worker(state)
+    w.opt.grab = GrabConfig(max_tries=cap)
+    w._process_one(_ctx(adapter), 1)
+    assert adapter.grabbed == []  # capped, did not grab one more release
     entry = _get(state)
     assert entry.status == PARKED and entry.retry_after is not None
 

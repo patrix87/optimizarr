@@ -159,7 +159,7 @@ cooldown_days = 30             # days to leave an exhausted item alone before re
 satisfied_score = 800000       # current-file score that satisfies despite too few candidates
 
 [optimizer.grab]               # grab lifecycle / anti-oscillation
-max_tries = 5                  # distinct releases to grab for one item before parking (cooldown_days)
+max_tries = 10                 # distinct releases to grab for one item before parking (cooldown_days)
 settle_minutes = 10            # wait this long AND for the item to leave the queue before resolving
 ```
 

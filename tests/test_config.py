@@ -359,7 +359,7 @@ def test_grab_defaults_and_override(monkeypatch, tmp_path):
     monkeypatch.setenv("RADARR_API_KEY", "k")
 
     defaults = load_config(None).optimizer.grab
-    assert defaults.max_tries == 5
+    assert defaults.max_tries == 10
     assert defaults.settle_minutes == 10
 
     path = _write(
