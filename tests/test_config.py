@@ -1,6 +1,6 @@
 import pytest
 
-from optimizarr.config import load_config
+from optimizarr.config import _load_defaults, load_config
 from optimizarr.features.optimizer.config import PICK_ORDERS
 from optimizarr.features.optimizer.worker import _PICK_ORDER_KEYS
 
@@ -329,49 +329,57 @@ def test_parses_topsis_presets_and_overrides(monkeypatch, tmp_path):
     assert t.default_preset in t.presets
 
 
-def test_retry_defaults_and_override(monkeypatch, tmp_path):
+def test_retry_defaults_match_toml_and_are_sane(monkeypatch):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
 
-    # No config.toml: the bundled defaults supply the retry block.
-    defaults = load_config(None).optimizer.retry
-    assert defaults.max_tries == 3
-    assert defaults.cooldown_days == 30
-    assert defaults.satisfied_score == 800000
+    # The loaded defaults must equal defaults.toml exactly (single source of truth, no hardcoding),
+    # and be sane by type/range. No literal default values are asserted here, so changing a default
+    # in defaults.toml needs no test edit.
+    toml = _load_defaults()["optimizer"]["retry"]
+    retry = load_config(None).optimizer.retry
+    assert retry.max_tries == toml["max_tries"]
+    assert retry.cooldown_days == toml["cooldown_days"]
+    assert retry.satisfied_score == toml["satisfied_score"]
+    assert isinstance(retry.max_tries, int) and retry.max_tries >= 1
+    assert isinstance(retry.cooldown_days, int) and retry.cooldown_days >= 0
+    assert isinstance(retry.satisfied_score, int) and retry.satisfied_score >= 0
 
-    # A partial override deep-merges over the defaults (only the named key changes).
-    path = _write(
-        tmp_path,
-        """
-        [optimizer.retry]
-        max_tries = 5
-        cooldown_days = 14
-        """,
-    )
+
+def test_retry_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+
+    # A partial override deep-merges over the defaults: only the named keys change.
+    path = _write(tmp_path, "[optimizer.retry]\nmax_tries = 5\ncooldown_days = 14\n")
     retry = load_config(path).optimizer.retry
-    assert retry.max_tries == 5
+    assert retry.max_tries == 5  # override input, not a default assertion
     assert retry.cooldown_days == 14
-    assert retry.satisfied_score == 800000  # untouched key keeps the default
+    # Untouched key still equals whatever the toml default is.
+    assert retry.satisfied_score == _load_defaults()["optimizer"]["retry"]["satisfied_score"]
 
 
-def test_grab_defaults_and_override(monkeypatch, tmp_path):
+def test_grab_defaults_match_toml_and_are_sane(monkeypatch):
     monkeypatch.setenv("RADARR_URL", "http://x")
     monkeypatch.setenv("RADARR_API_KEY", "k")
 
-    defaults = load_config(None).optimizer.grab
-    assert defaults.max_tries == 10
-    assert defaults.settle_minutes == 10
+    toml = _load_defaults()["optimizer"]["grab"]
+    grab = load_config(None).optimizer.grab
+    assert grab.max_tries == toml["max_tries"]
+    assert grab.settle_minutes == toml["settle_minutes"]
+    assert isinstance(grab.max_tries, int) and grab.max_tries >= 1
+    assert isinstance(grab.settle_minutes, int) and grab.settle_minutes >= 0
 
-    path = _write(
-        tmp_path,
-        """
-        [optimizer.grab]
-        max_tries = 2
-        """,
-    )
+
+def test_grab_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RADARR_URL", "http://x")
+    monkeypatch.setenv("RADARR_API_KEY", "k")
+
+    path = _write(tmp_path, "[optimizer.grab]\nmax_tries = 2\n")
     grab = load_config(path).optimizer.grab
-    assert grab.max_tries == 2
-    assert grab.settle_minutes == 10  # untouched key keeps the default
+    assert grab.max_tries == 2  # override input
+    # Untouched key still equals the toml default.
+    assert grab.settle_minutes == _load_defaults()["optimizer"]["grab"]["settle_minutes"]
 
 
 def test_parses_schedule(monkeypatch, tmp_path):

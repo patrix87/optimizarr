@@ -57,6 +57,10 @@ class ResolvedProfile:
     weights: dict[str, float]
 
 
+# NOTE: these config dataclasses carry NO default values for tuning fields. Every default lives in
+# defaults.toml (the single source of truth) and is read by the parse_* functions below with no
+# Python-side fallback. To build a config from the bundled defaults (e.g. in tests), parse them via
+# default_topsis() / default_optimizer(), never by relying on dataclass field defaults.
 @dataclass
 class TopsisConfig:
     default_preset: str
@@ -65,40 +69,41 @@ class TopsisConfig:
     #   Tier 1: keep score >= max_available - score_window (anchor at top of what's on offer).
     #   Tier 2: if fewer than min_candidates survive, expand down to current_file_score.
     #   Tier 3: if still fewer, expand to max(0, current_file_score - score_window) (full budget).
-    score_window: int = 100000
+    score_window: int
     # Minimum pool size used at two gates: (1) the score-window tier check (expand to the next
     # tier if too few survive the current one); (2) the TOPSIS gate (HOLD without satisfying if
     # fewer than this many remain after all filters -- relative min-max is untrustworthy too thin).
-    min_candidates: int = 2
+    min_candidates: int
     # ACT gate: both conditions must hold.
     #   1. Axis gate: at least one axis must move a meaningful amount vs the current file.
-    min_score_delta: int = 100
-    min_size_delta_gb: float = 0.5
+    min_score_delta: int
+    min_size_delta_gb: float
     #   2. Closeness gate: the pick's TOPSIS closeness must also improve by at least this.
     #      Prevents grabbing when an axis moved just enough but the overall balance did not improve.
-    min_closeness_gain: float = 0.02
+    min_closeness_gain: float
     # Outlier prefilter: drop a candidate whose GiB/h is below outlier_frac x the median GiB/h of
     # the surviving cluster. 0 disables it.
-    outlier_frac: float = 0.5
+    outlier_frac: float
     # Shared per-resolution {floor, ceiling} legitimacy band (GiB/h).
-    size_bounds: SizeBounds = field(default_factory=dict)
+    size_bounds: SizeBounds
+    # Per-profile-name overrides; absent means "no override", so an empty dict is the natural state.
     profiles: dict[str, ProfileOverride] = field(default_factory=dict)
 
 
 @dataclass
 class OptimizerAppConfig:
-    enabled: bool = True
-    min_age_days: int = 0
-    release_type: list[str] = field(default_factory=list)
+    enabled: bool
+    min_age_days: int
+    release_type: list[str]
     # If False, releases bigger than the current file are filtered out before scoring —
     # blocks resolution upgrades too (1080p -> 2160p is always a size increase).
-    allow_size_increase: bool = True
+    allow_size_increase: bool
     # If False, releases with a lower score than the current file are filtered out before scoring.
-    allow_quality_downgrade: bool = True
+    allow_quality_downgrade: bool
     # If True, queue items waiting for manual import don't count toward queue_max.
-    ignore_completed_in_queue: bool = True
+    ignore_completed_in_queue: bool
     # If True, the worker force-imports completed items rejected solely for score regression.
-    auto_import_downgrades: bool = True
+    auto_import_downgrades: bool
 
 
 @dataclass
@@ -110,9 +115,9 @@ class RetryConfig:
     Exception: a current file already scoring satisfied_score is good enough on its own, so the
     item is marked satisfied immediately instead of being retried."""
 
-    max_tries: int = 3
-    cooldown_days: int = 30
-    satisfied_score: int = 800000
+    max_tries: int
+    cooldown_days: int
+    satisfied_score: int
 
 
 @dataclass
@@ -125,8 +130,8 @@ class GrabConfig:
     imported (satisfy, no re-query), an unchanged file means it failed (try next-best). After
     max_tries distinct grabs without satisfying, the item is parked for retry.cooldown_days."""
 
-    max_tries: int = 10
-    settle_minutes: int = 10
+    max_tries: int
+    settle_minutes: int
 
 
 @dataclass
@@ -139,20 +144,19 @@ class ScheduleWindow:
 
 @dataclass
 class OptimizerConfig:
-    enabled: bool = False
-    queue_max: int = 5
-    import_max: int = 2
-    pick_order: str = "random"
-    process_interval_seconds: int = 15
-    list_refresh_minutes: int = 15
-    radarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
-    sonarr: OptimizerAppConfig = field(default_factory=OptimizerAppConfig)
-    topsis: TopsisConfig = field(default_factory=lambda: default_topsis())
-    retry: RetryConfig = field(default_factory=RetryConfig)
-    grab: GrabConfig = field(default_factory=GrabConfig)
+    enabled: bool
+    queue_max: int
+    import_max: int
+    pick_order: str
+    process_interval_seconds: int
+    list_refresh_minutes: int
+    radarr: OptimizerAppConfig
+    sonarr: OptimizerAppConfig
+    topsis: TopsisConfig
+    retry: RetryConfig
+    grab: GrabConfig
     # Per-day active-hours schedule (weekday int -> window, 0=Monday 6=Sunday).
-    # Empty dict means always active. Evaluation and list refresh are skipped outside the window;
-    # queue import processing always continues.
+    # Empty dict means always active (absence, not a tuning default), so a dict default is correct.
     schedule: dict[int, ScheduleWindow] = field(default_factory=dict)
 
 
@@ -382,3 +386,12 @@ def default_topsis() -> TopsisConfig:
     from optimizarr.config import _load_defaults
 
     return _parse_topsis(_load_defaults()["optimizer"]["topsis"])
+
+
+def default_optimizer() -> OptimizerConfig:
+    """Parse the bundled defaults' full [optimizer] section. Defaults live only in defaults.toml;
+    tests build a baseline from this (then dataclasses.replace to vary one field) instead of
+    hardcoding values, so changing a default in defaults.toml never requires a test edit."""
+    from optimizarr.config import _load_defaults
+
+    return parse_optimizer(_load_defaults()["optimizer"])

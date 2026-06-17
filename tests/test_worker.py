@@ -1,14 +1,13 @@
 import logging
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 
 from optimizarr.arr import ArrApi, RadarrApi
 from optimizarr.config import Connection
 from optimizarr.features.optimizer.config import (
-    GrabConfig,
-    OptimizerAppConfig,
-    OptimizerConfig,
     ScheduleWindow,
+    default_optimizer,
     default_topsis,
 )
 from optimizarr.features.optimizer.state import (
@@ -63,8 +62,14 @@ def _radarr_api():
     return RadarrApi(Connection(name="radarr", url="http://x", api_key="k"))
 
 
+def _app(**overrides):
+    """A per-app optimizer config from the bundled defaults, with only the named fields overridden.
+    Baselines come from defaults.toml, so changing a default never requires editing these tests."""
+    return replace(default_optimizer().radarr, **overrides)
+
+
 def _opt_cfg(min_age_days, release_type=("digitalRelease",)):
-    return OptimizerAppConfig(min_age_days=min_age_days, release_type=list(release_type))
+    return _app(min_age_days=min_age_days, release_type=list(release_type))
 
 
 def test_age_gate_disabled_passes_everything():
@@ -265,7 +270,9 @@ class _ProcessAdapter(ArrApi):
 
 def _worker(state, dry_run=False):
     w = OptimizerWorker.__new__(OptimizerWorker)
-    w.opt = OptimizerConfig(enabled=True)
+    # pick_order "random" keeps the pool order test-agnostic (no file_size sort on the doubles);
+    # per-pick_order ordering is covered separately by the order_pool tests.
+    w.opt = replace(default_optimizer(), pick_order="random")
     w.state = state
     cfg = default_topsis()
     cfg.min_candidates = 2  # worker tests use 2-candidate pools; pool-size tested in test_topsis
@@ -276,7 +283,7 @@ def _worker(state, dry_run=False):
 
 
 def _ctx(adapter):
-    ctx = _AppContext(adapter, OptimizerAppConfig())
+    ctx = _AppContext(adapter, _app())
     ctx.items_by_id = {1: {"id": 1}}
     return ctx
 
@@ -453,7 +460,7 @@ def test_grab_cap_parks_after_max_tries(tmp_path):
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
     w = _worker(state)
-    w.opt.grab = GrabConfig(max_tries=cap)
+    w.opt.grab = replace(w.opt.grab, max_tries=cap)
     w._process_one(_ctx(adapter), 1)
     assert adapter.grabbed == []  # capped, did not grab one more release
     entry = _get(state)
@@ -486,7 +493,7 @@ def test_process_app_once_downgrades_search_timeout_to_warning(tmp_path, caplog)
             raise ArrTimeout("GET /api/v3/release?movieId=1 timed out after 240s")
 
     adapter = _TimeoutAdapter(releases=[], current_file=None)
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     ctx.items_by_id = {1: {"id": 1}}
     ctx.pool = [1]
     ctx.last_refresh = datetime.now(UTC)  # keep needs_refresh() False
@@ -502,9 +509,12 @@ def test_process_app_once_downgrades_search_timeout_to_warning(tmp_path, caplog)
 
 
 def test_process_app_once_pauses_grabs_when_import_backlog_exceeds_max(tmp_path):
-    # More than import_max (default 2) completed downloads waiting to import -> stop grabbing
-    # so the backlog drains first. The pool item is left untouched (no grab).
+    # More than import_max completed downloads waiting to import -> stop grabbing so the backlog
+    # drains first. The pool item is left untouched (no grab). The record count is derived from the
+    # configured import_max, so the test does not hardcode the default.
     state = StateManager(str(tmp_path / "s.json"))
+    w = _worker(state)
+    over_max = w.opt.import_max + 1
     records = [
         {
             "id": i,
@@ -513,16 +523,14 @@ def test_process_app_once_pauses_grabs_when_import_backlog_exceeds_max(tmp_path)
             "status": "completed",
             "trackedDownloadState": "importPending",
         }
-        for i in range(3)  # 3 > import_max 2
+        for i in range(over_max)
     ]
     adapter = _QueueAdapter(records)
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     ctx.items_by_id = {1: {"id": 1}}
     ctx.pool = [1]
     ctx.last_refresh = datetime.now(UTC)  # keep needs_refresh() False
 
-    w = _worker(state)
-    assert w.opt.import_max == 2
     assert w._process_app_once(ctx) is False  # gate tripped
     assert ctx.pool == [1]  # pool item not consumed -> nothing grabbed
     assert 1 not in ctx.evaluated
@@ -543,7 +551,7 @@ class _GrabQueueAdapter(_ProcessAdapter):
 
 def test_importblocked_does_not_count_toward_import_gate(tmp_path):
     # importBlocked is manual-only; it must NOT count toward the gate, else a stuck manual item
-    # freezes grabbing forever. 5 importBlocked records (well over import_max 2) must still grab.
+    # freezes grabbing forever. Several importBlocked records (over import_max) must still grab.
     state = StateManager(str(tmp_path / "s.json"))
     records = [
         {
@@ -562,7 +570,7 @@ def test_importblocked_does_not_count_toward_import_gate(tmp_path):
         ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     ctx.items_by_id = {1: {"id": 1}}
     ctx.pool = [1]
     ctx.last_refresh = datetime.now(UTC)
@@ -582,7 +590,7 @@ def test_process_app_once_consumes_head_of_pool_first(tmp_path):
         releases=[_release(score=1_000_000, resolution=2160, size_gb=14.0)],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     ctx.items_by_id = {10: {"id": 10}, 20: {"id": 20}, 30: {"id": 30}}
     ctx.pool = [10, 20, 30]
     ctx.last_refresh = datetime.now(UTC)
@@ -597,7 +605,7 @@ def test_build_pool_holds_progress_across_refresh_then_resets(tmp_path):
     # until the whole active set is covered, then the pass resets.
     state = StateManager(str(tmp_path / "s.json"))
     w = _worker(state)
-    ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
+    ctx = _AppContext(_ProcessAdapter([], None), _app())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}, 3: {"id": 3}}
 
     w._build_pool(ctx)
@@ -747,7 +755,7 @@ def test_handle_queue_imports_force_imports_downgrades(tmp_path):
         "rejections": [{"reason": "Not an upgrade for existing movie file(s)"}],
     }
     adapter = _QueueAdapter([record], candidates={"dl1": [candidate]})
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     w = _worker(state)
     w._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
@@ -763,7 +771,7 @@ def test_handle_queue_imports_confirms_only_after_item_leaves_queue(tmp_path, ca
     record = _downgrade_record()
     candidate = {"path": "/x.mkv", "movie": {"id": 42}, "rejections": []}
     adapter = _QueueAdapter([record], candidates={"dl1": [candidate]})
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     w = _worker(state)
 
     with caplog.at_level(logging.INFO):
@@ -802,7 +810,7 @@ def test_handle_queue_imports_marks_nonimportable_skip_no_resubmit(tmp_path):
         ],
     }
     adapter = _QueueAdapter([_downgrade_record()], candidates={"dl1": [candidate]})
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     w = _worker(state)
 
     w._handle_queue_imports(ctx)
@@ -821,7 +829,7 @@ def test_handle_queue_imports_dry_run_does_not_post(tmp_path):
         [_downgrade_record()],
         candidates={"dl1": [{"path": "/x.mkv", "rejections": []}]},
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     w = _worker(state, dry_run=True)
     w._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
@@ -839,7 +847,7 @@ def test_handle_queue_imports_skips_when_candidates_have_other_rejections(tmp_pa
         ],
     }
     adapter = _QueueAdapter([_downgrade_record()], candidates={"dl1": [candidate]})
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     _worker(state)._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
     assert adapter.imports == []
@@ -851,7 +859,7 @@ def test_handle_queue_imports_disabled_is_noop(tmp_path):
         [_downgrade_record()],
         candidates={"dl1": [{"path": "/x.mkv", "rejections": []}]},
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     _worker(state)._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
     assert adapter.imports == []
@@ -864,7 +872,7 @@ def test_handle_queue_imports_skips_when_slot_busy(tmp_path):
         [_downgrade_record()],
         candidates={"dl1": [{"path": "/x.mkv", "rejections": []}]},
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
 
     # Occupy the slot with a long-running fake thread.
     blocker = threading.Event()
@@ -887,7 +895,7 @@ def test_handle_queue_imports_skips_downloadid_with_too_many_failures(tmp_path):
         [_downgrade_record()],
         candidates={"dl1": [{"path": "/x.mkv", "rejections": []}]},
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     ctx.import_slot._fail_counts["dl1"] = _MANUAL_IMPORT_MAX_FAILS
     _worker(state)._handle_queue_imports(ctx)
     _wait_for_slot(ctx)
@@ -945,7 +953,7 @@ def test_run_manual_import_returns_false_on_get_failure(tmp_path):
         records=[_downgrade_record()],
         raises={"dl1": "simulated timeout"},
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     w = _worker(state)
     assert w._run_manual_import(ctx, "Movie (2024)", "dl1") is False
     assert adapter.imports == []
@@ -966,7 +974,7 @@ def test_build_pool_excludes_satisfied(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     state.mark_satisfied("radarr", 2, "2160p Quality")  # same profile the adapter reports
     w = _worker(state)
-    ctx = _AppContext(_ProcessAdapter([], None), OptimizerAppConfig())
+    ctx = _AppContext(_ProcessAdapter([], None), _app())
     ctx.items_by_id = {1: {"id": 1}, 2: {"id": 2}}
     w._build_pool(ctx)
     assert ctx.pool == [1]  # satisfied item 2 (same profile, has file) is out of the pool
@@ -984,7 +992,7 @@ _ALL_DAYS_23_08 = {wd: ScheduleWindow(time(23, 0), time(8, 0)) for wd in range(7
 
 def _sched_worker():
     w = OptimizerWorker.__new__(OptimizerWorker)
-    w.opt = OptimizerConfig(enabled=True)
+    w.opt = default_optimizer()
     w._schedule_active = None
     return w
 
@@ -1053,7 +1061,7 @@ def test_process_app_once_skips_evaluation_outside_active_hours(tmp_path):
             return []
 
     adapter = _TrackingAdapter()
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=True))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=True))
     ctx.items_by_id = {1: {"id": 1}}
     ctx.pool = [1]
     ctx.last_refresh = datetime.now(UTC)
@@ -1079,7 +1087,7 @@ def test_process_app_once_active_override_proceeds_normally(tmp_path):
         ],
         current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
     )
-    ctx = _AppContext(adapter, OptimizerAppConfig(auto_import_downgrades=False))
+    ctx = _AppContext(adapter, _app(auto_import_downgrades=False))
     ctx.items_by_id = {1: {"id": 1}}
     ctx.pool = [1]
     ctx.last_refresh = datetime.now(UTC)
