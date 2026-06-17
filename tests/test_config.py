@@ -367,8 +367,10 @@ def test_grab_defaults_match_toml_and_are_sane(monkeypatch):
     grab = load_config(None).optimizer.grab
     assert grab.max_tries == toml["max_tries"]
     assert grab.settle_minutes == toml["settle_minutes"]
+    assert grab.blocklist_score_drop == toml["blocklist_score_drop"]
     assert isinstance(grab.max_tries, int) and grab.max_tries >= 1
     assert isinstance(grab.settle_minutes, int) and grab.settle_minutes >= 0
+    assert isinstance(grab.blocklist_score_drop, int) and grab.blocklist_score_drop >= 0
 
 
 def test_grab_override(monkeypatch, tmp_path):

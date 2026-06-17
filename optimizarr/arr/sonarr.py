@@ -81,3 +81,12 @@ class SonarrApi(ArrApi):
             "/api/v3/episode/monitor",
             {"episodeIds": item_ids, "monitored": monitored},
         )
+
+    def _grabbed_history(self, item: dict) -> list[dict]:
+        series_id = self._series(item).get("id")
+        return (
+            self.client.get(
+                f"/api/v3/history/series?seriesId={series_id}&episodeId={item['id']}&eventType=1"
+            )
+            or []
+        )

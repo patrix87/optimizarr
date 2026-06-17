@@ -59,3 +59,6 @@ class RadarrApi(ArrApi):
             "/api/v3/movie/editor",
             {"movieIds": item_ids, "monitored": monitored},
         )
+
+    def _grabbed_history(self, item: dict) -> list[dict]:
+        return self.client.get(f"/api/v3/history/movie?movieId={item['id']}&eventType=1") or []

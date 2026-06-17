@@ -53,7 +53,9 @@ Every item follows the lifecycle below. The key safety property is visible in it
 is remembered (`tried_guids`) and not grabbed again for the same profile, in-flight grabs resolve
 from the download queue and the file id (no extra indexer search to "confirm" success), and every
 loop is bounded, so the optimizer can never keep re-downloading the same release. A profile change or
-a removed file re-opens the item and clears that memory.
+a removed file re-opens the item and clears that memory. If a grabbed release **imports far below
+its advertised score** (it was misadvertised), optimizarr blocklists it in Radarr/Sonarr so it is
+gone for good, even across profile changes.
 
 ```mermaid
 stateDiagram-v2
@@ -66,6 +68,7 @@ stateDiagram-v2
     InFlight --> InFlight: still downloading
     InFlight --> Satisfied: imported (file changed)
     InFlight --> Eligible: download failed, try the next-best
+    InFlight --> Eligible: imported but misadvertised, release blocklisted
 
     Insufficient --> Eligible: cooldown ends or more releases appear
     Insufficient --> Satisfied: current file already scores high enough

@@ -109,7 +109,7 @@ def test_insufficient_round_trips_through_disk(tmp_path):
 
 def test_record_grab_is_in_flight_and_inactive(tmp_path):
     m = _mgr(tmp_path)
-    e = m.record_grab("radarr", 1, "2160p Quality", "guidA", 555)
+    e = m.record_grab("radarr", 1, "2160p Quality", "guidA", 555, 0)
     assert e.status == IN_FLIGHT and e.grabbed_guid == "guidA" and e.grabbed_file_id == 555
     assert e.tried_guids == ["guidA"]
     # In flight -> not active (the worker reconciles it, it is never searched while waiting).
@@ -118,9 +118,9 @@ def test_record_grab_is_in_flight_and_inactive(tmp_path):
 
 def test_record_grab_accumulates_tried_guids(tmp_path):
     m = _mgr(tmp_path)
-    m.record_grab("radarr", 1, "2160p Quality", "a", 555)
+    m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)
     m.resolve_in_flight("radarr", 1, imported=False)
-    m.record_grab("radarr", 1, "2160p Quality", "b", 555)
+    m.record_grab("radarr", 1, "2160p Quality", "b", 555, 0)
     acc = m.get("radarr", 1)
     assert acc is not None and acc.tried_guids == ["a", "b"]
     assert m.tried_guids("radarr", 1, "2160p Quality", has_file=True) == {"a", "b"}
@@ -128,10 +128,10 @@ def test_record_grab_accumulates_tried_guids(tmp_path):
 
 def test_resolve_in_flight_imported_satisfies_failed_opens(tmp_path):
     m = _mgr(tmp_path)
-    m.record_grab("radarr", 1, "2160p Quality", "a", 555)
+    m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)
     assert m.resolve_in_flight("radarr", 1, imported=True).status == SATISFIED
 
-    m.record_grab("radarr", 2, "2160p Quality", "b", 555)
+    m.record_grab("radarr", 2, "2160p Quality", "b", 555, 0)
     failed = m.resolve_in_flight("radarr", 2, imported=False)
     assert failed.status == OPEN and failed.tried_guids == ["b"]
     assert m.is_active("radarr", 2, "2160p Quality", has_file=True)  # open -> active
@@ -139,7 +139,7 @@ def test_resolve_in_flight_imported_satisfies_failed_opens(tmp_path):
 
 def test_tried_guids_ignored_on_profile_change_or_no_file(tmp_path):
     m = _mgr(tmp_path)
-    m.record_grab("radarr", 1, "2160p Quality", "a", 555)
+    m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)
     m.resolve_in_flight("radarr", 1, imported=False)
     assert m.tried_guids("radarr", 1, "2160p Efficient", has_file=True) == set()  # profile changed
     assert m.tried_guids("radarr", 1, "2160p Quality", has_file=False) == set()  # file removed
@@ -151,7 +151,7 @@ def test_profile_round_trip_reallows_a_previously_grabbed_release(tmp_path):
     m = _mgr(tmp_path)
 
     # 1. Watch in 4K: grab + import a 2160p release "A" under Quality.
-    m.record_grab("radarr", 1, "2160p Quality", "A", 100)
+    m.record_grab("radarr", 1, "2160p Quality", "A", 100, 0)
     entry = m.resolve_in_flight("radarr", 1, imported=True)
     assert entry.status == SATISFIED
     assert not m.is_active("radarr", 1, "2160p Quality", has_file=True)  # done for Quality
@@ -159,7 +159,7 @@ def test_profile_round_trip_reallows_a_previously_grabbed_release(tmp_path):
     # 2. Switch to a leaner profile: active again, and "A" is not remembered for the new profile.
     assert m.is_active("radarr", 1, "1080p Efficient", has_file=True)
     assert m.tried_guids("radarr", 1, "1080p Efficient", has_file=True) == set()
-    m.record_grab("radarr", 1, "1080p Efficient", "B", 100)
+    m.record_grab("radarr", 1, "1080p Efficient", "B", 100, 0)
     m.resolve_in_flight("radarr", 1, imported=True)
 
     # 3. Switch back to 2160p Quality months later: active again, and "A" is grabbable once more
@@ -170,7 +170,7 @@ def test_profile_round_trip_reallows_a_previously_grabbed_release(tmp_path):
 
 def test_park_sets_cooldown_and_clears_memory(tmp_path):
     m = _mgr(tmp_path)
-    m.record_grab("radarr", 1, "2160p Quality", "a", 555)
+    m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)
     m.resolve_in_flight("radarr", 1, imported=False)
     e = m.park("radarr", 1, "2160p Quality", cooldown_days=30)
     assert e.status == PARKED and e.retry_after is not None and e.tried_guids == []
@@ -180,17 +180,17 @@ def test_park_sets_cooldown_and_clears_memory(tmp_path):
 def test_in_flight_round_trips_through_disk(tmp_path):
     path = tmp_path / "state.json"
     m = StateManager(str(path))
-    m.record_grab("radarr", 9, "2160p Quality", "g", 42)
+    m.record_grab("radarr", 9, "2160p Quality", "g", 42, 880_000)
     entry = StateManager(str(path)).get("radarr", 9)
     assert entry is not None
     assert entry.status == IN_FLIGHT and entry.grabbed_guid == "g" and entry.grabbed_file_id == 42
-    assert entry.tried_guids == ["g"]
+    assert entry.grabbed_score == 880_000 and entry.tried_guids == ["g"]
 
 
 def test_in_flight_items_snapshot(tmp_path):
     m = _mgr(tmp_path)
-    m.record_grab("radarr", 1, "p", "a", 1)
-    m.record_grab("radarr", 2, "p", "b", 2)
+    m.record_grab("radarr", 1, "p", "a", 1, 0)
+    m.record_grab("radarr", 2, "p", "b", 2, 0)
     m.mark_satisfied("radarr", 3, "p")
     ids = {iid for iid, _ in m.in_flight_items("radarr")}
     assert ids == {1, 2}

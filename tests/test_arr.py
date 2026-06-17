@@ -176,3 +176,33 @@ def test_sonarr_releases_uses_generous_search_timeout():
     (path, timeout, _) = client.gets[0]
     assert path == "/api/v3/release?episodeId=7"
     assert timeout == RELEASE_SEARCH_TIMEOUT_SEC
+
+
+class _HistoryClient(_RecordingClient):
+    """A recording client whose GET returns a canned grabbed-history list."""
+
+    def __init__(self, history):
+        super().__init__()
+        self._history = history
+
+    def get(self, path, *, timeout=None, retry=True):
+        self.gets.append((path, timeout, retry))
+        return self._history
+
+
+def test_radarr_blocklist_grab_marks_matching_history_failed():
+    api = RadarrApi(_conn())
+    api.client = _HistoryClient(
+        [{"id": 10, "data": {"guid": "other"}}, {"id": 11, "data": {"guid": "target"}}]
+    )
+    assert api.blocklist_grab({"id": 7}, "target") is True
+    # Queried this movie's grabbed history, then marked the matching record failed (blocklist).
+    assert any("history/movie?movieId=7" in g[0] and "eventType=1" in g[0] for g in api.client.gets)
+    assert api.client.posts[0][0] == "/api/v3/history/failed/11"
+
+
+def test_blocklist_grab_returns_false_and_posts_nothing_when_no_match():
+    api = RadarrApi(_conn())
+    api.client = _HistoryClient([{"id": 10, "data": {"guid": "other"}}])
+    assert api.blocklist_grab({"id": 7}, "target") is False
+    assert api.client.posts == []

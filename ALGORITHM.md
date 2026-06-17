@@ -162,6 +162,7 @@ satisfied_score = 800000       # current-file score that satisfies despite too f
 [optimizer.grab]               # grab lifecycle / anti-oscillation
 max_tries = 10                 # distinct releases to grab for one item before parking (cooldown_days)
 settle_minutes = 10            # wait this long AND for the item to leave the queue before resolving
+blocklist_score_drop = 100000  # blocklist a release that imports this far below its advertised score
 ```
 
 A profile attaches to the preset whose name is a case-insensitive substring of the profile name
@@ -187,8 +188,10 @@ flowchart TD
     RC --> RCq{In queue or within settle window?}
     RCq -- yes --> RCk[Keep in_flight, wait]
     RCq -- no --> RCf{File id changed since grab?}
-    RCf -- yes --> RCsat[Mark satisfied: imported]
     RCf -- no --> RCopen[Mark open: grab failed, retry next-best later]
+    RCf -- yes --> RCdrop{Imported score dropped >= blocklist_score_drop?}
+    RCdrop -- no --> RCsat[Mark satisfied: imported]
+    RCdrop -- yes --> RCbl[Blocklist release in *arr, mark open]
     RC --> POOL[Build pool: skip satisfied, in_flight, active cooldowns]
     POOL --> GATE{Queue and import gate ok?}
     GATE -- no --> WAIT[Wait one tick]
@@ -226,6 +229,7 @@ stateDiagram-v2
     InFlight --> InFlight: still downloading or settling
     InFlight --> Satisfied: import detected, file id changed
     InFlight --> Eligible: grab failed, file unchanged, try next-best
+    InFlight --> Eligible: imported but misadvertised, release blocklisted
 
     Insufficient --> Eligible: cooldown elapsed or more releases appear
     Insufficient --> Satisfied: current score ≥ satisfied_score
@@ -254,6 +258,16 @@ stateDiagram-v2
   the next-best untried release is tried next pass (the failed one is blocklisted by Radarr/Sonarr
   **Failed Download Handling** *and* now in `tried_guids`). The settle window guards the gap between
   the grab and its appearance in the queue, so a fresh grab is never declared failed too early.
+- **Misadvertised releases are blocklisted (durable, cross-profile).** On import the worker also
+  compares the imported file's `customFormatScore` to the release's *advertised* score recorded at
+  grab time (same profile only, so the scores are comparable). If it dropped by at least
+  `grab.blocklist_score_drop` (default 100000), the file is not what the release name claimed:
+  optimizarr **blocklists the release in Radarr/Sonarr** (via the grabbed history record) and
+  re-opens the item to find a genuinely better one. A blocklisted release comes back in future
+  searches only with a `blocklisted` rejection, which inclusion filter 1 drops, so unlike the
+  per-profile `tried_guids` memory, this exclusion survives profile changes and a `state.json`
+  reset, permanently removing that broken release from the oscillation surface. Set the threshold
+  to 0 to disable.
 - **Never the same release twice (per profile).** Because every grab is remembered, the optimizer
   cannot loop on a release whose search-time score does not survive import (the classic re-grab
   trap): it grabs that release at most once, then either the import satisfies it or it moves on,

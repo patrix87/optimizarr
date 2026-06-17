@@ -319,6 +319,22 @@ class OptimizerWorker:
             if item is None:
                 continue  # not in the current list (removed / age-gated) -> leave as-is
             imported = adapter.current_file_id(item) != entry.grabbed_file_id
+            # Misadvertised release: it imported far below its advertised score (same profile). The
+            # file is not what the release claimed, so blocklist it in *arr (never grabbed again)
+            # and re-open the item to find a genuinely better release instead of marking satisfied.
+            if imported and self._is_misadvertised(ctx, item, entry):
+                blocklisted = adapter.blocklist_grab(item, entry.grabbed_guid or "")
+                self.state.resolve_in_flight(adapter.app, item_id, imported=False)
+                logger.info(
+                    "[%s] %s: imported >= %d below advertised score; %s, re-evaluating",
+                    adapter.app,
+                    adapter.label(item),
+                    self.opt.grab.blocklist_score_drop,
+                    "blocklisted the release"
+                    if blocklisted
+                    else "could not find grab to blocklist",
+                )
+                continue
             self.state.resolve_in_flight(adapter.app, item_id, imported)
             logger.info(
                 "[%s] %s: in-flight grab resolved -> %s",
@@ -326,6 +342,21 @@ class OptimizerWorker:
                 adapter.label(item),
                 "imported, satisfied" if imported else "failed, will try next-best",
             )
+
+    def _is_misadvertised(self, ctx: _AppContext, item: dict, entry) -> bool:
+        """True if the imported file scores at least grab.blocklist_score_drop below the grabbed
+        release's advertised customFormatScore, with the profile unchanged since the grab (so the
+        two scores are comparable). Reads the imported file only when the check is enabled."""
+        drop_min = self.opt.grab.blocklist_score_drop
+        if drop_min <= 0 or entry.grabbed_score is None:
+            return False
+        profile_name, _ = ctx.adapter.profile_for(item)
+        if entry.profile != profile_name:
+            return False  # profile changed -> scores not comparable
+        imported_score = (ctx.adapter.current_file(item) or {}).get("customFormatScore")
+        if imported_score is None:
+            return False
+        return (entry.grabbed_score - imported_score) >= drop_min
 
     def _process_one(self, ctx: _AppContext, item_id: int) -> None:
         adapter = ctx.adapter
@@ -383,12 +414,18 @@ class OptimizerWorker:
         # Record the grab as in-flight BEFORE the POST so a crash in between cannot double-grab:
         # the guid is now in tried_guids, and reconciliation will treat the (possibly never-sent)
         # grab as failed and move on to the next-best untried release.
-        guid = (decision.release or {}).get("guid")
+        release = decision.release or {}
+        guid = release.get("guid")
         if guid:
             self.state.record_grab(
-                adapter.app, item_id, profile_name, guid, adapter.current_file_id(item)
+                adapter.app,
+                item_id,
+                profile_name,
+                guid,
+                adapter.current_file_id(item),
+                release.get("customFormatScore"),
             )
-        adapter.grab(decision.release or {})
+        adapter.grab(release)
 
     def _record_insufficient(
         self, ctx: _AppContext, item_id: int, profile_name: str | None, label: str

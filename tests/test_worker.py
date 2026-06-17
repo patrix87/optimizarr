@@ -240,6 +240,7 @@ class _ProcessAdapter(ArrApi):
         self._releases = releases
         self._current = current_file
         self.grabbed: list[dict] = []
+        self.blocklisted: list[str] = []
         self.release_calls = 0
 
     def runtime_h(self, item):
@@ -247,6 +248,10 @@ class _ProcessAdapter(ArrApi):
 
     def profile_for(self, item):
         return ("2160p Quality", 2160)
+
+    def blocklist_grab(self, item, guid):
+        self.blocklisted.append(guid)
+        return True
 
     def has_file(self, item):
         return True
@@ -366,7 +371,7 @@ def test_process_one_never_regrabs_a_tried_release(tmp_path):
     # The only real upgrade has already been grabbed (in tried_guids); the remaining untried
     # releases are worse than the current file -> give up and satisfy, never grab the tried one.
     state = StateManager(str(tmp_path / "s.json"))
-    state.record_grab("radarr", 1, "2160p Quality", "up", 555)
+    state.record_grab("radarr", 1, "2160p Quality", "up", 555, 0)
     state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried_guids=["up"]
     adapter = _ProcessAdapter(
         releases=[
@@ -412,7 +417,7 @@ def test_reconcile_imported_satisfies_without_requery(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
     adapter._current["id"] = 555
-    state.record_grab("radarr", 1, "2160p Quality", "best", 555)
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555, 0)
     adapter._current["id"] = 999  # import replaced the file
     w = _worker(state)
     w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now(state))
@@ -424,7 +429,7 @@ def test_reconcile_failed_opens_and_keeps_memory(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
     adapter._current["id"] = 555
-    state.record_grab("radarr", 1, "2160p Quality", "best", 555)  # file id unchanged after
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555, 0)  # file id unchanged after
     w = _worker(state)
     w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now(state))
     entry = _get(state)
@@ -435,7 +440,7 @@ def test_reconcile_waits_while_in_queue_or_unsettled(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     adapter = _ProcessAdapter(releases=[], current_file=_file(score=1, resolution=2160, size_gb=9))
     adapter._current["id"] = 999  # would look "imported" if it resolved
-    state.record_grab("radarr", 1, "2160p Quality", "best", 555)
+    state.record_grab("radarr", 1, "2160p Quality", "best", 555, 0)
     w = _worker(state)
     # Still in the queue -> stays in flight.
     w._reconcile_in_flight(_ctx(adapter), queue_ids={1}, now=_settled_now(state))
@@ -445,12 +450,60 @@ def test_reconcile_waits_while_in_queue_or_unsettled(tmp_path):
     assert _get(state).status == IN_FLIGHT
 
 
+def _misadvertised_setup(tmp_path, imported_score, grabbed_score=900_000, profile="2160p Quality"):
+    state = StateManager(str(tmp_path / "s.json"))
+    adapter = _ProcessAdapter(
+        releases=[], current_file=_file(score=imported_score, resolution=2160, size_gb=9)
+    )
+    adapter._current["id"] = 555
+    state.record_grab("radarr", 1, profile, "lie", 555, grabbed_score)
+    adapter._current["id"] = 999  # the grab imported (new file id)
+    return state, adapter
+
+
+def test_reconcile_blocklists_misadvertised_import(tmp_path):
+    # Advertised 900k, imported only 100k (drop 800k >= 100k default): blocklist the release and
+    # re-open the item to find a genuinely better one, rather than marking the lie satisfied.
+    state, adapter = _misadvertised_setup(tmp_path, imported_score=100_000)
+    _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
+    assert adapter.blocklisted == ["lie"]
+    assert _get(state).status == OPEN
+
+
+def test_reconcile_keeps_satisfied_on_small_score_drop(tmp_path):
+    # Advertised 900k, imported 850k (drop 50k < 100k): a normal small variance, not misadvertised.
+    state, adapter = _misadvertised_setup(tmp_path, imported_score=850_000)
+    _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
+    assert adapter.blocklisted == []
+    assert _get(state).status == SATISFIED
+
+
+def test_reconcile_skips_blocklist_when_profile_changed(tmp_path):
+    # Grabbed under a different profile than the item now has -> the scores are not comparable, so
+    # the drop check is skipped (no blocklist).
+    state, adapter = _misadvertised_setup(
+        tmp_path, imported_score=100_000, profile="1080p Efficient"
+    )
+    _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
+    assert adapter.blocklisted == []
+    assert _get(state).status == SATISFIED
+
+
+def test_reconcile_blocklist_disabled_when_threshold_zero(tmp_path):
+    state, adapter = _misadvertised_setup(tmp_path, imported_score=0)
+    w = _worker(state)
+    w.opt.grab = replace(w.opt.grab, blocklist_score_drop=0)
+    w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
+    assert adapter.blocklisted == []
+    assert _get(state).status == SATISFIED
+
+
 def test_grab_cap_parks_after_max_tries(tmp_path):
     state = StateManager(str(tmp_path / "s.json"))
     cap = 3
     # Pre-seed `cap` distinct tried releases.
     for i in range(cap):
-        state.record_grab("radarr", 1, "2160p Quality", f"g{i}", 555)
+        state.record_grab("radarr", 1, "2160p Quality", f"g{i}", 555, 0)
     state.resolve_in_flight("radarr", 1, imported=False)  # -> open, tried has `cap` guids
     adapter = _ProcessAdapter(
         releases=[

@@ -128,10 +128,16 @@ class GrabConfig:
     only releases that would beat the current file are ones already tried, the item is satisfied. A
     grab is held in-flight until it leaves the queue and settles; a changed file id means it
     imported (satisfy, no re-query), an unchanged file means it failed (try next-best). After
-    max_tries distinct grabs without satisfying, the item is parked for retry.cooldown_days."""
+    max_tries distinct grabs without satisfying, the item is parked for retry.cooldown_days.
+
+    blocklist_score_drop: if a grabbed release imports at least this far below its advertised
+    customFormatScore (same profile), it was misadvertised; blocklist it in *arr so it is never
+    grabbed again (future searches return it as 'blocklisted', which the eligible() filter drops).
+    0 disables the check."""
 
     max_tries: int
     settle_minutes: int
+    blocklist_score_drop: int
 
 
 @dataclass
@@ -281,7 +287,16 @@ def _parse_grab(raw: dict) -> GrabConfig:
     settle_minutes = int(raw["settle_minutes"])
     if settle_minutes < 0:
         raise ValueError(f"optimizer.grab.settle_minutes must be >= 0, got {settle_minutes}")
-    return GrabConfig(max_tries=max_tries, settle_minutes=settle_minutes)
+    blocklist_score_drop = int(raw["blocklist_score_drop"])
+    if blocklist_score_drop < 0:
+        raise ValueError(
+            f"optimizer.grab.blocklist_score_drop must be >= 0, got {blocklist_score_drop}"
+        )
+    return GrabConfig(
+        max_tries=max_tries,
+        settle_minutes=settle_minutes,
+        blocklist_score_drop=blocklist_score_drop,
+    )
 
 
 def _parse_release_types(raw: object, allowed: set[str], where: str) -> list[str]:

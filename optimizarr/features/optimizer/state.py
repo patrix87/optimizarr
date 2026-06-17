@@ -53,6 +53,7 @@ class StateEntry:
     grabbed_file_id: int | None = (
         None  # IN_FLIGHT only: current file id at grab time (import probe)
     )
+    grabbed_score: int | None = None  # IN_FLIGHT only: advertised customFormatScore at grab time
 
 
 def _now_iso() -> str:
@@ -88,6 +89,7 @@ class StateManager:
                     grabbed_guid=entry.get("grabbed_guid"),
                     grabbed_at=entry.get("grabbed_at"),
                     grabbed_file_id=entry.get("grabbed_file_id"),
+                    grabbed_score=entry.get("grabbed_score"),
                 )
 
     def _save_locked(self) -> None:
@@ -168,11 +170,18 @@ class StateManager:
             self._save_locked()
 
     def record_grab(
-        self, app: str, item_id: int, profile: str | None, guid: str, file_id: int | None
+        self,
+        app: str,
+        item_id: int,
+        profile: str | None,
+        guid: str,
+        file_id: int | None,
+        score: int | None,
     ) -> StateEntry:
         """Persist that we are about to grab `guid` for this item (call BEFORE the grab POST so a
         crash in between can never cause a duplicate grab). Appends the guid to tried_guids and
-        records the current file id so a later import can be detected by a file-id change."""
+        records the current file id (to detect a later import by a file-id change) and the release's
+        advertised customFormatScore (to detect a misadvertised release after import)."""
         with self._lock:
             prev = self._data.get(app, {}).get(str(item_id))
             tried = list(prev.tried_guids) if (prev and prev.profile == profile) else []
@@ -186,6 +195,7 @@ class StateManager:
                 grabbed_guid=guid,
                 grabbed_at=_now_iso(),
                 grabbed_file_id=file_id,
+                grabbed_score=score,
             )
             self._data.setdefault(app, {})[str(item_id)] = new
             self._save_locked()
