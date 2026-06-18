@@ -240,7 +240,6 @@ class _ProcessAdapter(ArrApi):
         self._releases = releases
         self._current = current_file
         self.grabbed: list[dict] = []
-        self.blocklisted: list[str] = []
         self.release_calls = 0
 
     def runtime_h(self, item):
@@ -248,10 +247,6 @@ class _ProcessAdapter(ArrApi):
 
     def profile_for(self, item):
         return ("2160p Quality", 2160)
-
-    def blocklist_grab(self, item, guid):
-        self.blocklisted.append(guid)
-        return True
 
     def has_file(self, item):
         return True
@@ -386,6 +381,23 @@ def test_process_one_never_regrabs_a_tried_release(tmp_path):
     assert _get(state).status == SATISFIED
 
 
+def test_process_one_skips_blocklisted_release(tmp_path):
+    # A blocklisted release is never grabbed, even though it is the best candidate; the next-best
+    # untried, non-blocklisted release is grabbed instead.
+    state = StateManager(str(tmp_path / "s.json"))
+    state.add_to_blocklist("radarr", 1, "bad")
+    adapter = _ProcessAdapter(
+        releases=[
+            _release(guid="bad", score=1_000_000, resolution=2160, size_gb=10.0),
+            _release(guid="alt", score=980_000, resolution=2160, size_gb=11.0),
+            _release(guid="filler", score=950_000, resolution=2160, size_gb=12.0),
+        ],
+        current_file=_file(score=200_000, resolution=1080, size_gb=30.0),
+    )
+    _worker(state)._process_one(_ctx(adapter), 1)
+    assert [r["guid"] for r in adapter.grabbed] == ["alt"]
+
+
 def test_no_double_grab_across_a_failed_cycle(tmp_path):
     # grab best -> in_flight -> reconcile as failed -> re-evaluate grabs the NEXT-best untried
     # release, never the same one twice.
@@ -462,11 +474,11 @@ def _misadvertised_setup(tmp_path, imported_score, grabbed_score=900_000, profil
 
 
 def test_reconcile_blocklists_misadvertised_import(tmp_path):
-    # Advertised 900k, imported only 100k (drop 800k >= 100k default): blocklist the release and
-    # re-open the item to find a genuinely better one, rather than marking the lie satisfied.
+    # Advertised 900k, imported only 100k (drop 800k >= 100k default): add the release to our own
+    # permanent blocklist and re-open the item, rather than marking the lie satisfied.
     state, adapter = _misadvertised_setup(tmp_path, imported_score=100_000)
     _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
-    assert adapter.blocklisted == ["lie"]
+    assert state.blocklisted("radarr", 1) == {"lie"}
     assert _get(state).status == OPEN
 
 
@@ -474,7 +486,7 @@ def test_reconcile_keeps_satisfied_on_small_score_drop(tmp_path):
     # Advertised 900k, imported 850k (drop 50k < 100k): a normal small variance, not misadvertised.
     state, adapter = _misadvertised_setup(tmp_path, imported_score=850_000)
     _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
-    assert adapter.blocklisted == []
+    assert state.blocklisted("radarr", 1) == set()
     assert _get(state).status == SATISFIED
 
 
@@ -485,7 +497,7 @@ def test_reconcile_skips_blocklist_when_profile_changed(tmp_path):
         tmp_path, imported_score=100_000, profile="1080p Efficient"
     )
     _worker(state)._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
-    assert adapter.blocklisted == []
+    assert state.blocklisted("radarr", 1) == set()
     assert _get(state).status == SATISFIED
 
 
@@ -494,7 +506,7 @@ def test_reconcile_blocklist_disabled_when_threshold_zero(tmp_path):
     w = _worker(state)
     w.opt.grab = replace(w.opt.grab, blocklist_score_drop=0)
     w._reconcile_in_flight(_ctx(adapter), queue_ids=set(), now=_settled_now())
-    assert adapter.blocklisted == []
+    assert state.blocklisted("radarr", 1) == set()
     assert _get(state).status == SATISFIED
 
 

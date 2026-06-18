@@ -320,19 +320,19 @@ class OptimizerWorker:
                 continue  # not in the current list (removed / age-gated) -> leave as-is
             imported = adapter.current_file_id(item) != entry.grabbed_file_id
             # Misadvertised release: it imported far below its advertised score (same profile). The
-            # file is not what the release claimed, so blocklist it in *arr (never grabbed again)
-            # and re-open the item to find a genuinely better release instead of marking satisfied.
-            if imported and self._is_misadvertised(ctx, item, entry):
-                blocklisted = adapter.blocklist_grab(item, entry.grabbed_guid or "")
+            # file is not what the release claimed, so add it to our permanent blocklist (never
+            # grabbed again, even across profile changes) and re-open the item to find a genuinely
+            # better release instead of marking the lie satisfied. Download FAILURES are not handled
+            # here: Radarr/Sonarr already blocklist those, and the eligible() filter drops them.
+            if imported and entry.grabbed_guid and self._is_misadvertised(ctx, item, entry):
+                self.state.add_to_blocklist(adapter.app, item_id, entry.grabbed_guid)
                 self.state.resolve_in_flight(adapter.app, item_id, imported=False)
                 logger.info(
-                    "[%s] %s: imported >= %d below advertised score; %s, re-evaluating",
+                    "[%s] %s: imported >= %d below advertised score; blocklisted release, "
+                    "re-evaluating",
                     adapter.app,
                     adapter.label(item),
                     self.opt.grab.blocklist_score_drop,
-                    "blocklisted the release"
-                    if blocklisted
-                    else "could not find grab to blocklist",
                 )
                 continue
             self.state.resolve_in_flight(adapter.app, item_id, imported)
@@ -366,8 +366,10 @@ class OptimizerWorker:
         has_file = adapter.has_file(item)
         current_file = adapter.current_file(item)
         releases = adapter.releases(item)
-        # Releases already grabbed for this item are never grabbed again (anti-oscillation).
+        # Releases already grabbed for this item are never grabbed again: tried (per-profile,
+        # anti-oscillation) plus the permanent blocklist (releases proved broken, all profiles).
         tried = self.state.tried_guids(adapter.app, item_id, profile_name, has_file)
+        blocklist = self.state.blocklisted(adapter.app, item_id)
 
         decision = decide(
             self.topsis,
@@ -380,6 +382,7 @@ class OptimizerWorker:
             allow_quality_downgrade=ctx.app_cfg.allow_quality_downgrade,
             satisfied_score=self.opt.retry.satisfied_score,
             tried_guids=tried,
+            blocklist=blocklist,
         )
         label = adapter.label(item)
         logger.info("%s", format_decision(adapter.app, label, decision, self.dry_run))

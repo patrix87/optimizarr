@@ -21,6 +21,10 @@ Resolution of an in_flight grab is computed by the worker from the live queue + 
 (a changed file id means the grab imported -> satisfy, with no extra indexer query; an unchanged
 file means it failed -> try the next-best). All writes are atomic and lock-guarded, so a crash never
 yields a torn file and reconciliation re-derives in_flight outcomes idempotently after a restart.
+
+Separately, a permanent per-item blocklist (stored under the reserved "blocklist" key, NOT on the
+per-item entries) holds release guids proved broken (imported far below their advertised score). It
+is never wiped, even on a profile change, and the decision drops those candidates before scoring.
 """
 
 import json
@@ -60,11 +64,19 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# Reserved top-level state.json key holding the permanent per-item blocklist (app -> item id ->
+# release guids). It lives outside the per-item StateEntry lifecycle on purpose: unlike tried_guids
+# (per-profile, wiped on a profile change), the blocklist is NEVER cleared, so a release we proved
+# is broken stays excluded across profile changes and even a partial state rebuild.
+_BLOCKLIST_KEY = "blocklist"
+
+
 class StateManager:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
         self._data: dict[str, dict[str, StateEntry]] = {"radarr": {}, "sonarr": {}}
+        self._blocklist: dict[str, dict[str, list[str]]] = {"radarr": {}, "sonarr": {}}
         self._load()
 
     def _load(self) -> None:
@@ -76,7 +88,13 @@ class StateManager:
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("[state] could not read %s (%s); starting empty", self.path, e)
             return
+        for app, items in (raw.get(_BLOCKLIST_KEY) or {}).items():
+            self._blocklist.setdefault(app, {})
+            for item_id, guids in items.items():
+                self._blocklist[app][str(item_id)] = list(guids)
         for app, items in raw.items():
+            if app == _BLOCKLIST_KEY:
+                continue
             bucket = self._data.setdefault(app, {})
             for item_id, entry in items.items():
                 bucket[str(item_id)] = StateEntry(
@@ -93,9 +111,13 @@ class StateManager:
                 )
 
     def _save_locked(self) -> None:
-        serializable = {
+        serializable: dict = {
             app: {item_id: asdict(entry) for item_id, entry in items.items()}
             for app, items in self._data.items()
+        }
+        serializable[_BLOCKLIST_KEY] = {
+            app: {item_id: list(guids) for item_id, guids in items.items() if guids}
+            for app, items in self._blocklist.items()
         }
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path) or ".", suffix=".tmp")
@@ -159,6 +181,20 @@ class StateManager:
         if entry is None or not has_file or entry.profile != profile:
             return set()
         return set(entry.tried_guids)
+
+    def blocklisted(self, app: str, item_id: int) -> set[str]:
+        """Permanently blocklisted release guids for this item (proved broken, e.g. imported far
+        below their advertised score). Unlike tried_guids this is never wiped, so it holds across
+        profile changes; the decision drops these candidates before scoring."""
+        return set(self._blocklist.get(app, {}).get(str(item_id), []))
+
+    def add_to_blocklist(self, app: str, item_id: int, guid: str) -> None:
+        """Permanently blocklist a release guid for this item (idempotent)."""
+        with self._lock:
+            guids = self._blocklist.setdefault(app, {}).setdefault(str(item_id), [])
+            if guid not in guids:
+                guids.append(guid)
+                self._save_locked()
 
     def mark_satisfied(self, app: str, item_id: int, profile: str | None) -> None:
         with self._lock:

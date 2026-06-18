@@ -70,6 +70,19 @@ def test_tried_release_is_dropped_before_scoring():
     assert d.action == "ACT" and d.release is not None and d.release["guid"] == "alt"
 
 
+def test_blocklisted_release_is_dropped_before_scoring():
+    # A blocklisted release is excluded just like a tried one; the next-best untried,
+    # non-blocklisted release is picked instead.
+    rels = [
+        _release("bad", 1_000_000, 2160, 13.0),  # blocklisted (proved broken)
+        _release("alt", 980_000, 2160, 14.0),
+        _release("filler", 950_000, 2160, 15.0),
+    ]
+    cur = _file(200_000, 2160, 30.0)
+    d = decide(_topsis(), rels, 2.0, "2160p Quality", 2160, cur, blocklist={"bad"})
+    assert d.action == "ACT" and d.release is not None and d.release["guid"] == "alt"
+
+
 def test_give_up_and_satisfy_when_only_tried_release_beats_current():
     # The lone real upgrade is tried; the remaining untried releases are worse than the current
     # file -> nothing untried clears the gate -> satisfy (this is the anti-oscillation give-up).

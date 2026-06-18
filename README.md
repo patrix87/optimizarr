@@ -54,8 +54,9 @@ is remembered (`tried_guids`) and not grabbed again for the same profile, in-fli
 from the download queue and the file id (no extra indexer search to "confirm" success), and every
 loop is bounded, so the optimizer can never keep re-downloading the same release. A profile change or
 a removed file re-opens the item and clears that memory. If a grabbed release **imports far below
-its advertised score** (it was misadvertised), optimizarr blocklists it in Radarr/Sonarr so it is
-gone for good, even across profile changes.
+its advertised score** (it was misadvertised), optimizarr adds it to its own **permanent blocklist**
+so it is gone for good, even across profile changes. (Download failures are left to Radarr/Sonarr,
+whose blocklist optimizarr already honors.)
 
 ```mermaid
 stateDiagram-v2

@@ -168,6 +168,25 @@ def test_profile_round_trip_reallows_a_previously_grabbed_release(tmp_path):
     assert m.tried_guids("radarr", 1, "2160p Quality", has_file=True) == set()
 
 
+def test_blocklist_is_permanent_and_survives_profile_change_and_disk(tmp_path):
+    path = tmp_path / "state.json"
+    m = StateManager(str(path))
+    m.add_to_blocklist("radarr", 1, "broken")
+    m.add_to_blocklist("radarr", 1, "broken")  # idempotent
+    assert m.blocklisted("radarr", 1) == {"broken"}
+
+    # Unlike tried_guids, the blocklist is independent of profile and the entry lifecycle.
+    m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)
+    m.resolve_in_flight("radarr", 1, imported=True)  # satisfied entry rewritten
+    assert m.blocklisted("radarr", 1) == {"broken"}
+    assert m.blocklisted("radarr", 1) == m.blocklisted("radarr", 1)  # profile-agnostic
+
+    # Persists across reload, under the reserved "blocklist" key (not the per-item entries).
+    reloaded = StateManager(str(path))
+    assert reloaded.blocklisted("radarr", 1) == {"broken"}
+    assert reloaded.blocklisted("radarr", 2) == set()
+
+
 def test_park_sets_cooldown_and_clears_memory(tmp_path):
     m = _mgr(tmp_path)
     m.record_grab("radarr", 1, "2160p Quality", "a", 555, 0)

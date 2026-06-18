@@ -130,9 +130,11 @@ satisfied_score = 800000 # current-file score at/above which "too few candidates
 max_tries = 10       # distinct releases to grab for one item before parking it for retry.cooldown_days
 settle_minutes = 10  # after a grab, wait this long AND for the item to leave the queue before re-eval
 # If a grabbed release imports at least this far below its advertised customFormatScore (with the
-# profile unchanged), it was misadvertised (the file is not what the release name claimed). Blocklist
-# it in Radarr/Sonarr so it is never grabbed again: future searches return it as "blocklisted",
-# which the inclusion filter drops. The item is then re-evaluated to find a genuinely better release.
+# profile unchanged), it was misadvertised (the file is not what the release name claimed). Add it to
+# optimizarr's own permanent blocklist so it is never grabbed again, even across profile changes (the
+# blocklist is never wiped, unlike the per-profile grab memory). The item is then re-evaluated to find
+# a genuinely better release. Download failures are not handled here: Radarr/Sonarr already blocklist
+# those, and a blocklisted release comes back in searches as "blocklisted", which the filter drops.
 # 0 disables the check.
 blocklist_score_drop = 100000
 

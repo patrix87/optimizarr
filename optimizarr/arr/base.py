@@ -113,23 +113,6 @@ class ArrApi:
             {"guid": release["guid"], "indexerId": release.get("indexerId")},
         )
 
-    def blocklist_grab(self, item: dict, guid: str) -> bool:
-        """Blocklist the grab whose release `guid` matches, so the release is never grabbed again.
-
-        Finds the item's 'grabbed' history record carrying this guid and marks it failed, which adds
-        the release to the *arr blocklist. Future searches then return it with a 'blocklisted'
-        rejection, which the optimizer's inclusion filter drops. Returns True if a matching grab
-        record was found and the failed/blocklist call was posted."""
-        for rec in self._grabbed_history(item):
-            if (rec.get("data") or {}).get("guid") == guid:
-                self.client.post(f"/api/v3/history/failed/{rec['id']}", {})
-                return True
-        return False
-
-    def _grabbed_history(self, item: dict) -> list[dict]:
-        """The item's 'grabbed' (eventType=1) history records (app-specific endpoint)."""
-        raise NotImplementedError
-
     def queue_items(self) -> list[dict]:
         """Full queue records (status, trackedDownloadState, statusMessages, etc.) — the
         worker computes both the queue_max count and the in-progress item-id set from this."""
